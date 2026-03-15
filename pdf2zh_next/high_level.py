@@ -108,6 +108,77 @@ class SubprocessCrashError(TranslationError):
 logger = logging.getLogger(__name__)
 
 
+def _should_hide_verbose_error_details(details: str | None) -> bool:
+    text = (details or "").strip()
+    return bool(text) and (
+        "traceback" in text.lower() or "\n" in text or len(text) > 180
+    )
+
+
+def _log_error_details(
+    log: logging.Logger,
+    label: str,
+    details: str | None,
+    *,
+    debug: bool,
+) -> None:
+    text = (details or "").strip()
+    if not text:
+        return
+    if debug or not _should_hide_verbose_error_details(text):
+        log.error("%s: %s", label, text)
+        return
+    log.error("%s hidden. Rerun with --debug for full details.", label)
+
+
+def _log_batch_translation_summary(
+    *,
+    successful_files: list[dict[str, str | None]],
+    failed_files: list[dict[str, str]],
+) -> None:
+    total_files = len(successful_files) + len(failed_files)
+    if total_files == 0:
+        return
+
+    logger.info(
+        "Batch translation summary: %s succeeded, %s failed.",
+        len(successful_files),
+        len(failed_files),
+    )
+
+    for item in successful_files:
+        logger.info(
+            "  OK %s | mono=%s | dual=%s",
+            item["file"],
+            item["mono_pdf_path"] or "None",
+            item["dual_pdf_path"] or "None",
+        )
+
+    for item in failed_files:
+        logger.error("  FAIL %s | %s", item["file"], item["reason"])
+
+
+_PDF_SIGNATURE = b"%PDF-"
+
+
+def validate_pdf_file(file: Path | str) -> Path:
+    """Ensure the input path exists and points to a readable PDF file."""
+    file_path = Path(file)
+    if not file_path.exists():
+        raise FileNotFoundError(f"file {file_path} not found")
+    if not file_path.is_file():
+        raise ValueError(f"Input path is not a file: {file_path}")
+
+    try:
+        with file_path.open("rb") as input_file:
+            if input_file.read(len(_PDF_SIGNATURE)) != _PDF_SIGNATURE:
+                raise ValueError(f"Input file is not a valid PDF document: {file_path}")
+    except OSError as exc:
+        raise ValueError(f"Input file could not be read: {file_path}") from exc
+
+    return file_path
+
+
 def _translate_wrapper(
     settings: SettingsModel,
     file: Path,
@@ -250,7 +321,13 @@ def _translate_wrapper(
                 # Capture non-babeldoc errors during translation
                 tb_str = traceback.format_exc()
                 if not cancel_event.is_set():
-                    logger.error(f"Error in translate_wrapper_async: {e}\n{tb_str}")
+                    logger.error("Error in translate_wrapper_async: %s", e)
+                    _log_error_details(
+                        logger,
+                        "Subprocess traceback",
+                        tb_str,
+                        debug=settings.basic.debug,
+                    )
                 error = SubprocessError(
                     message=f"Error during translation process: {e}",
                     traceback_str=tb_str,
@@ -268,7 +345,13 @@ def _translate_wrapper(
             # Capture errors that might occur outside the async context
             tb_str = traceback.format_exc()
             if not cancel_event.is_set():
-                logger.error(f"Error running async translation: {e}\n{tb_str}")
+                logger.error("Error running async translation: %s", e)
+                _log_error_details(
+                    logger,
+                    "Subprocess traceback",
+                    tb_str,
+                    debug=settings.basic.debug,
+                )
             error = SubprocessError(
                 message=f"Failed to run translation process: {e}", traceback_str=tb_str
             )
@@ -280,7 +363,13 @@ def _translate_wrapper(
     except Exception as e:
         # Capture any errors during setup or initialization
         tb_str = traceback.format_exc()
-        logger.error(f"Subprocess initialization error: {e}\n{tb_str}")
+        logger.error("Subprocess initialization error: %s", e)
+        _log_error_details(
+            logger,
+            "Subprocess traceback",
+            tb_str,
+            debug=settings.basic.debug,
+        )
         try:
             error = SubprocessError(
                 message=f"Translation subprocess initialization error: {e}",
@@ -607,11 +696,13 @@ def create_babeldoc_config(settings: SettingsModel, file: Path) -> BabelDOCConfi
 
 
 async def do_translate_async_stream(
-    settings: SettingsModel, file: Path | str
+    settings: SettingsModel,
+    file: Path | str,
+    *,
+    raise_on_error: bool = True,
 ) -> AsyncGenerator[dict, None]:
     settings.validate_settings()
-    if isinstance(file, str):
-        file = Path(file)
+    file = validate_pdf_file(file)
 
     if settings.basic.input_files and len(settings.basic.input_files):
         logger.warning(
@@ -619,9 +710,6 @@ async def do_translate_async_stream(
             "pdf2zh_next.highlevel.do_translate_async_stream will ignore this field "
             "and only translate the file pointed to by the file parameter."
         )
-
-    if not file.exists():
-        raise FileNotFoundError(f"file {file} not found")
 
     # 开始翻译
     translate_func = partial(_translate_in_subprocess, settings, file)
@@ -642,11 +730,24 @@ async def do_translate_async_stream(
                 break
     except TranslationError as e:
         # Log and re-raise structured errors
-        logger.error(f"Translation error: {e}")
+        logger.error(
+            "Translation error: %s",
+            e.raw_message if isinstance(e, SubprocessError) else e,
+        )
         if isinstance(e, BabeldocError) and e.original_error:
-            logger.error(f"Original babeldoc error: {e.original_error}")
+            _log_error_details(
+                logger,
+                "Original babeldoc error",
+                str(e.original_error),
+                debug=settings.basic.debug,
+            )
         elif isinstance(e, SubprocessError) and e.traceback_str:
-            logger.error(f"Subprocess traceback: {e.traceback_str}")
+            _log_error_details(
+                logger,
+                "Subprocess traceback",
+                e.traceback_str,
+                debug=settings.basic.debug,
+            )
         # Create an error event to yield to client code
         error_event = {
             "type": "error",
@@ -657,7 +758,8 @@ async def do_translate_async_stream(
             or "",
         }
         yield error_event
-        raise  # Re-raise the exception so that the caller can handle it if needed
+        if raise_on_error:
+            raise
 
 
 async def do_translate_file_async(
@@ -675,20 +777,31 @@ async def do_translate_file_async(
         use_rich_pbar=True,
     )
     progress_context, progress_handler = create_progress_handler(rich_pbar_config)
-    input_files = settings.basic.input_files
-    assert len(input_files) >= 1, "At least one input file is required"
-    settings.basic.input_files = set()
+    batch_settings = settings.clone()
+    input_files = sorted(batch_settings.basic.input_files)
+    if not input_files:
+        raise ValueError(
+            "At least one input PDF is required before starting translation."
+        )
+    batch_settings.basic.input_files = set()
 
     error_count = 0
+    successful_files: list[dict[str, str | None]] = []
+    failed_files: list[dict[str, str]] = []
 
     for file in input_files:
         logger.info(f"translate file: {file}")
+        file_failure_reason: str | None = None
         # 开始翻译
         with progress_context:
             try:
-                async for event in do_translate_async_stream(settings, file):
+                async for event in do_translate_async_stream(
+                    batch_settings,
+                    file,
+                    raise_on_error=False,
+                ):
                     progress_handler(event)
-                    if settings.basic.debug:
+                    if batch_settings.basic.debug:
                         logger.debug(event)
                     if event["type"] == "finish":
                         result = event["translate_result"]
@@ -697,6 +810,17 @@ async def do_translate_file_async(
                         logger.info(f"  Time Cost: {result.total_seconds:.2f}s")
                         logger.info(f"  Mono PDF: {result.mono_pdf_path or 'None'}")
                         logger.info(f"  Dual PDF: {result.dual_pdf_path or 'None'}")
+                        successful_files.append(
+                            {
+                                "file": str(file),
+                                "mono_pdf_path": str(result.mono_pdf_path)
+                                if result.mono_pdf_path
+                                else None,
+                                "dual_pdf_path": str(result.dual_pdf_path)
+                                if result.dual_pdf_path
+                                else None,
+                            }
+                        )
 
                         token_usage = event.get("token_usage", {})
                         if token_usage:
@@ -738,26 +862,48 @@ async def do_translate_file_async(
                         error_type = event.get("error_type", "UnknownError")
                         details = event.get("details", "")
 
-                        logger.error(f"Error translating file {file}: {error_msg}")
-                        logger.error(f"Error type: {error_type}")
-                        if details:
-                            logger.error(f"Error details: {details}")
+                        logger.error("Error translating file %s: %s", file, error_msg)
+                        logger.error("Error type: %s", error_type)
+                        _log_error_details(
+                            logger,
+                            "Error details",
+                            details,
+                            debug=settings.basic.debug,
+                        )
 
+                        file_failure_reason = error_msg
                         error_count += 1
+                        failed_files.append(
+                            {"file": str(file), "reason": file_failure_reason}
+                        )
                         if not ignore_error:
                             raise RuntimeError(f"Translation error: {error_msg}")
                         break
             except TranslationError as e:
                 # Already logged in do_translate_async_stream
-                error_count += 1
+                if file_failure_reason is None:
+                    file_failure_reason = str(e)
+                    error_count += 1
+                    failed_files.append(
+                        {"file": str(file), "reason": file_failure_reason}
+                    )
                 if not ignore_error:
                     raise
             except Exception as e:
                 logger.error(f"Error translating file {file}: {e}")
-                error_count += 1
+                if file_failure_reason is None:
+                    file_failure_reason = str(e)
+                    error_count += 1
+                    failed_files.append(
+                        {"file": str(file), "reason": file_failure_reason}
+                    )
                 if not ignore_error:
                     raise
 
+    _log_batch_translation_summary(
+        successful_files=successful_files,
+        failed_files=failed_files,
+    )
     return error_count
 
 

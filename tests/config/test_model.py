@@ -344,6 +344,16 @@ class TestCLIEnvSettingsModel:
         with pytest.raises(ValueError, match="File is not a PDF file"):
             settings.validate_settings()
 
+        pdf_directory = tmp_path / "pdfs"
+        pdf_directory.mkdir()
+        (pdf_directory / "paper.pdf").write_bytes(b"%PDF-1.4\n")
+        settings = CLIEnvSettingsModel(
+            openai=True,
+            openai_detail={"openai_api_key": "test-key"},
+            basic={"input_files": {str(pdf_directory)}},
+        )
+        settings.validate_settings()
+
     def test_parse_pages(self):
         """Test page range parsing"""
         # Test None case

@@ -21,7 +21,7 @@ The network is receiving interference, please use a stable network link or try t
 I want to use some of the features of the latest version, how do I update it?
 
 - **Answer**:  
-`pip install -U pdf2zh`
+`pip install -U pdf2zh-next`
 
 
 ## The following files do not exist: example.pdf
@@ -31,7 +31,7 @@ When executing the program, users would have the following outputs: `The followi
 - **Solution**:
   - Open the command line in the directory where the file is located, or
   - Enter the full path of the file directly after pdf2zh, or
-  - Use the interactive mode `pdf2zh -i` to drag and drop files directly
+  - Start the WebUI with `pdf2zh_next --gui` and upload the PDF in the browser
 
 
 ## SSL Error and Other Network Issues
@@ -41,8 +41,8 @@ When downloading hugging face models, users in China may get network error. For 
 - **Solution**:
   - [Bypass GFW](https://github.com/clash-verge-rev/clash-verge-rev).
   - [Use Hugging Face Mirror](https://hf-mirror.com/).
-  - [Use Portable version](https://github.com/PDFMathTranslate/PDFMathTranslate-next?tab=readme-ov-file#method-ii-portable).
-  - [Use Docker instead](https://github.com/PDFMathTranslate/PDFMathTranslate-next#docker).
+  - [Use the Windows EXE package with bundled assets](./getting-started/INSTALLATION_winexe.md).
+  - [Use Docker instead](./getting-started/INSTALLATION_docker.md).
   - [Update Certificates](https://stackoverflow.com/questions/51925384/unable-to-get-local-issuer-certificate-when-using-requests), as suggested in [issue #55](https://github.com/PDFMathTranslate/PDFMathTranslate-next/issues/55).
 
 ## Localhost is not accessible

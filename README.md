@@ -68,9 +68,9 @@ You can try our application out using either of the following services:
 
 ### Installation
 
-1. [**Windows EXE**](https://pdf2zh-next.com/getting-started/INSTALLATION_winexe.html) <small>Recommand for Windows</small>
-2. [**Docker**](https://pdf2zh-next.com/getting-started/INSTALLATION_docker.html) <small>Recommand for Linux</small>
-3. [**uv** (a Python package manager)](https://pdf2zh-next.com/getting-started/INSTALLATION_uv.html) <small>Recommand for macOS</small>
+1. [**Windows EXE**](https://pdf2zh-next.com/getting-started/INSTALLATION_winexe.html) <small>Recommended for Windows</small>
+2. [**Docker**](https://pdf2zh-next.com/getting-started/INSTALLATION_docker.html) <small>Recommended for Linux</small>
+3. [**uv** (a Python package manager)](https://pdf2zh-next.com/getting-started/INSTALLATION_uv.html) <small>Recommended for macOS</small>
 
 ---
 
@@ -80,7 +80,20 @@ You can try our application out using either of the following services:
 2. [Using **Zotero Plugin**](https://github.com/guaguastandup/zotero-pdf2zh) (Third party program)
 3. [Using **Commandline**](https://pdf2zh-next.com/getting-started/USAGE_commandline.html)
 
-For different use cases, we provide distinct methods to use our program. Check out [this page](./getting-started/getting-started.md) for more information.
+For different use cases, we provide distinct methods to use our program. Check out [this page](https://pdf2zh-next.com/getting-started/getting-started.html) for more information.
+
+### Quick Start
+
+After installation, the fastest way to verify the setup is:
+
+```bash
+pdf2zh_next --warmup
+pdf2zh_next --gui
+pdf2zh_next ./paper.pdf --output ./translated
+python -m pdf2zh_next ./paper.pdf --output ./translated
+```
+
+If you do not pass an engine flag such as `--openai`, the CLI uses `SiliconFlowFree` by default. On the first run, BabelDOC assets are downloaded automatically. If your network blocks `api1.pdf2zh-next.com` or `api2.pdf2zh-next.com`, switch to another service or pre-download the assets with `pdf2zh_next --warmup`. When the local WebUI port is busy, start it with `--server-port <free-port>`.
 
 <h2 id="usage">Advanced Options</h2>
 

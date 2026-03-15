@@ -14,7 +14,7 @@ To install uv on your computer, please refer to [this article](https://docs.astr
 
 #### Installation
 
-1. Python installed (3.10 <= version <= 3.12);
+1. Python installed (3.10 <= version < 3.14);
 
 2. Use the following command to use our package:
 
@@ -24,6 +24,9 @@ To install uv on your computer, please refer to [this article](https://docs.astr
     ```
 
 After installation, you can start translation via the **command line** or **WebUI**.
+
+> [!NOTE]
+> On the first run, PDFMathTranslate downloads the required BabelDOC assets. The default `pdf2zh_next document.pdf` flow uses `SiliconFlowFree`; if that service is unreachable from your network, switch to another engine or run `pdf2zh_next --warmup` before starting.
 
 !!! Warning
 

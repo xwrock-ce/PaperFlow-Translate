@@ -8,9 +8,11 @@
 
 There are several methods to open the WebUI interface. If you are using **Windows**, please refer to [this article](./INSTALLATION_winexe.md);
 
-1. Python installed (3.10 <= version <= 3.12)
+1. Python installed (3.10 <= version < 3.14)
 
 2. Install our package:
+
+   Follow [Installation via uv](./INSTALLATION_uv.md), or use the [Windows EXE](./INSTALLATION_winexe.md) / [Docker](./INSTALLATION_docker.md) guide if that matches your environment.
 
 3. Start using in browser:
 
@@ -18,7 +20,7 @@ There are several methods to open the WebUI interface. If you are using **Window
     pdf2zh_next --gui
     ```
 
-4. If your browswer has not been started automatically, goto
+4. If your browser has not been started automatically, open the default address below in your browser (or the custom port you set with `--server-port`):
 
     ```bash
     http://localhost:7860/
@@ -26,7 +28,7 @@ There are several methods to open the WebUI interface. If you are using **Window
 
     Drop the PDF file into the window and click `Translate`.
 
-5. If you deploy PDFMathTranslate with docker, and you are using ollama as PDFMathTranslate's backend LLM, you should fill "Ollama host" with
+5. The first launch may spend some time downloading BabelDOC assets. If you deploy PDFMathTranslate with Docker and use Ollama as the backend LLM, fill `Ollama host` with:
 
    ```bash
    http://host.docker.internal:11434

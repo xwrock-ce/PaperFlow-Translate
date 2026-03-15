@@ -46,6 +46,22 @@ class TestBuildArgsParser:
         assert "basic" in field_name2type
         assert "translation" in field_name2type
 
+    def test_default_true_boolean_fields_use_negative_flags(self):
+        parser, _ = build_args_parser()
+
+        parsed_args = parser.parse_args(["--no-translate-table-text"])
+
+        assert parsed_args.translate_table_text is False
+
+    def test_help_includes_quick_start_examples(self):
+        parser, _ = build_args_parser()
+
+        help_text = parser.format_help()
+
+        assert "Quick start:" in help_text
+        assert "python -m pdf2zh_next paper.pdf --output ./translated" in help_text
+        assert "SiliconFlowFree is used by default." in help_text
+
 
 class TestConfigManager:
     def test_singleton(self):
@@ -160,6 +176,29 @@ class TestConfigManager:
         assert cm.settings.translation.qps == 15  # CLI value should override env var
         assert cm.settings.report_interval == 0.5  # Should use env var
         assert cm.settings is not None
+
+    def test_initialize_cli_config_rejects_missing_explicit_config_file(
+        self, tmp_path: Path
+    ):
+        cm = ConfigManager()
+        missing_config = tmp_path / "missing.toml"
+        args = Namespace(config_file=str(missing_config), version=True)
+
+        with patch("argparse.ArgumentParser.parse_args", return_value=args):
+            with pytest.raises(ValueError, match="Config file does not exist"):
+                cm.initialize_cli_config()
+
+    def test_initialize_cli_config_rejects_invalid_explicit_config_file(
+        self, tmp_path: Path
+    ):
+        cm = ConfigManager()
+        invalid_config = tmp_path / "broken.toml"
+        invalid_config.write_text("invalid = toml [", encoding="utf-8")
+        args = Namespace(config_file=str(invalid_config), version=True)
+
+        with patch("argparse.ArgumentParser.parse_args", return_value=args):
+            with pytest.raises(ValueError, match="Error reading config file"):
+                cm.initialize_cli_config()
 
     @pytest.fixture
     def sample_toml_content(self) -> str:
@@ -394,9 +433,8 @@ class TestConfigManager:
 
         # Mock command line arguments
         with patch("argparse.ArgumentParser.parse_args", return_value=args):
-            # Should not raise exception, should use default values
-            cm.initialize_config()
-            assert cm.settings is not None
+            with pytest.raises(ValueError, match="Config file does not exist"):
+                cm.initialize_config()
 
     def test_initialize_config_with_invalid_toml(self, temp_config_dir: Path):
         """Test initialization with invalid TOML content"""
@@ -414,9 +452,8 @@ class TestConfigManager:
 
         # Mock command line arguments
         with patch("argparse.ArgumentParser.parse_args", return_value=args):
-            # Should not raise exception, should use default values
-            cm.initialize_config()
-            assert cm.settings is not None
+            with pytest.raises(ValueError, match="Error reading config file"):
+                cm.initialize_config()
 
     def test_nested_config_priority(self, monkeypatch: pytest.MonkeyPatch):
         """Test priority handling with nested configurations"""

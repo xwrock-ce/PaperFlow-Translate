@@ -40,7 +40,7 @@ class BasicSettings(BaseModel):
     """Basic application settings"""
 
     input_files: set[str] = Field(
-        default=set(), description="Input PDF files to process"
+        default=set(), description="Input PDF files or directories containing PDFs"
     )
     debug: bool = Field(default=False, description="Enable debug mode")
     gui: bool = Field(default=False, description="Enable GUI mode")
@@ -252,27 +252,24 @@ class SettingsModel(BaseModel):
         """Validate settings"""
         # Validate translation service selection
 
-        if self.basic.warmup:
-            # warmup mode only download and verify assets
-            # so no need to validate other settings
-            return
-
         if self.basic.generate_offline_assets and self.basic.restore_offline_assets:
             raise ValueError(
                 "generate_offline_assets and restore_offline_assets cannot both be set"
             )
 
-        if self.basic.generate_offline_assets:
-            # only generate offline assets
+        if (
+            self.basic.version
+            or self.basic.gui
+            or self.basic.warmup
+            or self.basic.generate_offline_assets
+            or self.basic.restore_offline_assets
+        ):
+            # These modes do not require a translation engine or input files up front.
             # so no need to validate other settings
             return
 
         if not self.translate_engine_settings:
             raise ValueError("Must provide a translation service")
-
-        # Log the current translation engine being used
-        engine_name = self.translate_engine_settings.translate_engine_type
-        log.info(f"Using translation engine: {engine_name}")
 
         self.translate_engine_settings.validate_settings()
         if hasattr(self.translate_engine_settings, "transform"):
@@ -327,6 +324,8 @@ class SettingsModel(BaseModel):
             file_path = Path(file.strip("\"'"))
             if not file_path.exists():
                 raise ValueError(f"File does not exist: {file}")
+            if file_path.is_dir():
+                continue
             if not file_path.suffix.lower() == ".pdf":
                 raise ValueError(f"File is not a PDF file: {file}")
 
@@ -346,6 +345,8 @@ class SettingsModel(BaseModel):
                 re.compile(self.pdf.formular_char_pattern)
             except re.error as e:
                 raise ValueError(f"Invalid formular_char_pattern: {e}") from e
+
+        self.parse_pages()
 
         if self.pdf.enhance_compatibility:
             self.pdf.skip_clean = True

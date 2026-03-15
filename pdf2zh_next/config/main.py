@@ -5,6 +5,7 @@ import ast
 import copy
 import logging
 import os
+import textwrap
 import threading
 import typing
 from inspect import getdoc
@@ -46,6 +47,27 @@ class MagicDefault:
     pass
 
 
+class _CLIHelpFormatter(argparse.RawDescriptionHelpFormatter):
+    pass
+
+
+_CLI_HELP_DESCRIPTION = "Translate PDF papers or folders of PDFs while preserving formulas, figures, and layout."
+_CLI_HELP_EPILOG = textwrap.dedent(
+    """\
+    Quick start:
+      pdf2zh_next --warmup
+      pdf2zh_next paper.pdf --output ./translated
+      pdf2zh_next ./papers --output ./translated
+      pdf2zh_next --openai --openai-api-key $OPENAI_API_KEY paper.pdf
+      pdf2zh_next --gui
+      python -m pdf2zh_next paper.pdf --output ./translated
+
+    Notes:
+      If no engine flag is provided, SiliconFlowFree is used by default.
+    """
+)
+
+
 def build_args_parser(
     parser: argparse.ArgumentParser | None = None,
     settings_model: type[BaseModel] | None = None,
@@ -54,7 +76,12 @@ def build_args_parser(
     set_count: int = 0,
 ) -> tuple[argparse.ArgumentParser, dict[str, Any]]:
     if parser is None:
-        parser = argparse.ArgumentParser()
+        parser = argparse.ArgumentParser(
+            prog="pdf2zh_next",
+            description=_CLI_HELP_DESCRIPTION,
+            epilog=_CLI_HELP_EPILOG,
+            formatter_class=_CLIHelpFormatter,
+        )
 
     if field_name2type is None:
         field_name2type = {}
@@ -116,13 +143,19 @@ def build_args_parser(
 
             for arg in args:
                 if arg is bool:
+                    option_name = f"--{args_name}"
+                    action = "store_true"
+                    argument_kwargs: dict[str, Any] = {}
+                    if field_detail.default is True:
+                        option_name = f"--no-{args_name}"
+                        action = "store_false"
+                        argument_kwargs["dest"] = field_name
                     parser.add_argument(
-                        f"--{args_name}",
-                        action="store_true"
-                        if field_detail.default is False
-                        else "store_false",
+                        option_name,
+                        action=action,
                         default=MagicDefault,
                         help=field_detail.description,
+                        **argument_kwargs,
                     )
                 elif arg == NoneType:
                     continue
@@ -154,11 +187,12 @@ class ConfigManager:
         """Ensure the configuration directory exists"""
         DEFAULT_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 
-    def _read_toml_file(self, file_path: Path) -> dict:
+    def _read_toml_file(self, file_path: Path, *, strict: bool = False) -> dict:
         """Read and parse a TOML file
 
         Args:
             file_path: Path to the TOML file
+            strict: Raise a ValueError instead of falling back to {}
 
         Returns:
             Parsed TOML content as dictionary
@@ -169,10 +203,14 @@ class ConfigManager:
                     content = tomlkit.load(f)
             # Convert "null" strings back to None
             return self._process_toml_content(dict(content))
-        except FileNotFoundError:
+        except FileNotFoundError as e:
+            if strict:
+                raise ValueError(f"Config file does not exist: {file_path}") from e
             log.debug(f"Config file not found: {file_path}")
             return {}
         except Exception as e:
+            if strict:
+                raise ValueError(f"Error reading config file {file_path}: {e}") from e
             log.warning(f"Error reading config file {file_path}: {e}")
             return {}
 
@@ -585,12 +623,10 @@ class ConfigManager:
         )
         config_from_file_dicts = []
         if "config_file" in merged_args:
-            user_config = self._read_toml_file(Path(merged_args["config_file"]))
+            config_path = Path(merged_args["config_file"]).expanduser()
+            user_config = self._read_toml_file(config_path, strict=True)
             if not self.test_config(user_config):
-                log.error(
-                    f"Error in test_config: {merged_args['config_file']}, skip it"
-                )
-                user_config = {}
+                raise ValueError(f"Invalid config file: {config_path}")
 
             config_from_file_dicts.append(copy.deepcopy(user_config))
             del merged_args["config_file"]

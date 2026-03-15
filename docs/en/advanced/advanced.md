@@ -125,7 +125,7 @@ If your translation service has a limit of 600 RPM:
 - `pool_size = 10 * 10 = 100`
 
 ```bash
-pdf2zh example.pdf --qps 10 --pool-max-worker 100
+pdf2zh example.pdf --qps 10 --pool-max-workers 100
 ```
 
 ##### Concurrent Connection Limiting
@@ -142,7 +142,7 @@ If your translation service allows 50 concurrent connections:
 - `qps = 45`
 
 ```bash
-pdf2zh example.pdf --qps 45 --pool-max-worker 45
+pdf2zh example.pdf --qps 45 --pool-max-workers 45
 ```
 
 ##### Best Practices
