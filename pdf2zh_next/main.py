@@ -47,10 +47,7 @@ def _print_cli_usage_hint() -> None:
 
 def _build_cli_error_hint(message: str) -> str | None:
     searchable_message = message.lower()
-    if (
-        "--server-port" in searchable_message
-        or "gradio_server_port" in searchable_message
-    ):
+    if "--server-port" in searchable_message:
         return None
     if any(token in searchable_message for token in ("api key", "credential", "auth")):
         return (
@@ -108,10 +105,7 @@ def _build_cli_error_hint(message: str) -> str | None:
         or "fallback port probing is blocked" in searchable_message
         or ("port" in searchable_message and "in use" in searchable_message)
     ):
-        return (
-            "Retry the GUI with --server-port <free-port>, or set "
-            "GRADIO_SERVER_PORT before starting --gui."
-        )
+        return "Retry the GUI with --server-port <free-port>."
     return None
 
 
@@ -257,15 +251,11 @@ async def main() -> int:
         return 0
 
     if settings.basic.gui:
-        from pdf2zh_next.gui import setup_gui
+        from pdf2zh_next.web import setup_gui
 
         _warmup_assets()
         try:
-            setup_gui(
-                auth_file=settings.gui_settings.auth_file,
-                welcome_page=settings.gui_settings.welcome_page,
-                server_port=settings.gui_settings.server_port,
-            )
+            await setup_gui(server_port=settings.gui_settings.server_port)
         except Exception as exc:
             _print_cli_error(
                 f"Failed to start GUI: {exc}",

@@ -170,6 +170,7 @@ cython_debug/
 .idea/
 .vscode
 .DS_Store
+frontend/node_modules/
 uv.lock
 *.pdf
 *.docx

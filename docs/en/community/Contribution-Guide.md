@@ -16,7 +16,7 @@ Thank you for your interest in this project! Before you start contributing, plea
 4. Other contributions deemed inappropriate by the maintainers.
 5. Contributing documentation, but changing the documentation in languages other than English.
 6. PRs that require modifying PDF files.
-7. PRs that modify the `pdf2zh_next/gui_translation.yaml` file.
+7. PRs that modify generated PDF fixtures or other non-source artifacts.
 
 Please do NOT submit PRs related to the above types.
 
@@ -118,7 +118,7 @@ For the following types of PRs, it is recommended to discuss with maintainers fi
 
 - **config folder**: Configuration system.
 - **translator folder**: Translator-related implementations.
-- **gui.py**: Provides the GUI interface.
+- **web.py**: Starts the React-based WebUI.
 - **const.py**: Some constants.
 - **main.py**: Provides the command-line tool.
 - **high_level.py**: High-level interfaces based on BabelDOC.

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import runpy
-import sys
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -112,12 +111,8 @@ def test_main_reports_gui_startup_failure(capsys, monkeypatch):
     )
     warmup_mock = Mock()
     monkeypatch.setattr("pdf2zh_next.main.babeldoc.assets.assets.warmup", warmup_mock)
-    setup_gui_mock = Mock(side_effect=RuntimeError("no local port was available"))
-    monkeypatch.setitem(
-        sys.modules,
-        "pdf2zh_next.gui",
-        SimpleNamespace(setup_gui=setup_gui_mock),
-    )
+    setup_gui_mock = AsyncMock(side_effect=RuntimeError("no local port was available"))
+    monkeypatch.setattr("pdf2zh_next.web.setup_gui", setup_gui_mock)
 
     exit_code = asyncio.run(main())
 
@@ -126,7 +121,7 @@ def test_main_reports_gui_startup_failure(capsys, monkeypatch):
     assert "Failed to start GUI: no local port was available" in captured.err
     assert "Retry the GUI with --server-port <free-port>" in captured.err
     warmup_mock.assert_called_once()
-    setup_gui_mock.assert_called_once()
+    setup_gui_mock.assert_awaited_once()
 
 
 def test_main_returns_non_zero_when_translation_reports_errors(monkeypatch, tmp_path):

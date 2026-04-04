@@ -34,6 +34,8 @@ There are several methods to open the WebUI interface. If you are using **Window
    http://host.docker.internal:11434
    ```
 
+   If you are running from a source checkout, make sure `npm` is installed locally. The React WebUI is built automatically on first launch when the frontend assets are missing.
+
 <!-- <img src="./images/gui.gif" width="500"/> -->
 <img src='./../../images/gui.gif' width="500"/>
 

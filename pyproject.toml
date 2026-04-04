@@ -28,10 +28,7 @@ dependencies = [
     "deepl",
     "openai>=1.0.0",
     "azure-ai-translation-text<=1.0.1",
-    # 5.36 has a bug, webui starts with a white screen
-    "gradio<5.36",
     "tencentcloud-sdk-python-tmt",
-    "gradio-pdf>=0.0.21",
     "peewee>=3.17.8",
     "fontTools",
     "babeldoc>=0.5.20,<0.6.0",
@@ -41,10 +38,12 @@ dependencies = [
     "httpx>=0.28.1",
     "sse-starlette>=2.3.3",
     "fastapi>=0.115.12",
+    "python-multipart>=0.0.20",
     "uvicorn>=0.34.2",
+    "langcodes>=3.5.0",
+    "tomlkit>=0.13.3",
     "legacy-cgi; python_version >= '3.13'",
     "chardet>=5.2.0",
-    "gradio-i18n==0.3.4", # since we have hooked it for language selection
     "pyyaml>=6.0.2",
 ]
 
@@ -160,7 +159,6 @@ convention = "google"
 max-complexity = 10 # 函数圈复杂度阈值
 
 [tool.ruff.lint.per-file-ignores]
-"pdf2zh_next/gui.py" = ["S104"] # 忽略命名规范
 "tests/*" = ["S101"]            # 在测试文件中允许 assert
 "**/__init__.py" = ["F401"]     # 允许未使用的导入
 "docs/*" = ["A001"]

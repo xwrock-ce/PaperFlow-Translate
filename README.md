@@ -94,6 +94,7 @@ python -m pdf2zh_next ./paper.pdf --output ./translated
 ```
 
 If you do not pass an engine flag such as `--openai`, the CLI uses `SiliconFlowFree` by default. On the first run, BabelDOC assets are downloaded automatically. If your network blocks `api1.pdf2zh-next.com` or `api2.pdf2zh-next.com`, switch to another service or pre-download the assets with `pdf2zh_next --warmup`. When the local WebUI port is busy, start it with `--server-port <free-port>`.
+When you run the new React-based WebUI from a source checkout, `npm` must be available locally because `pdf2zh_next --gui` will build the frontend automatically if the static assets are missing.
 
 <h2 id="usage">Advanced Options</h2>
 
@@ -125,7 +126,7 @@ If you don't know what code to use to translate to the language you need, check 
 
 - PDF Parsing: [Pdfminer.six](https://github.com/pdfminer/pdfminer.six)
 
-- PDF Preview: [Gradio PDF](https://github.com/freddyaboulton/gradio-pdf)
+- PDF Preview: native browser PDF embedding
 
 - Layout Parsing: [DocLayout-YOLO](https://github.com/opendatalab/DocLayout-YOLO)
 

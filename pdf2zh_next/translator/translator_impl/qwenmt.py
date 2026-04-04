@@ -45,7 +45,7 @@ class QwenMtTranslator(BaseTranslator):
     def lang_mapping(self, input_lang: str) -> str:
         """
         Mapping the language code to the language code that Aliyun Qwen-MT model supports.
-        Since all existings languagues codes used in gui.py are able to be mapped, the original
+        Since all existing language codes exposed by the WebUI are able to be mapped, the original
         languague code will not be checked.
         """
         langdict = {

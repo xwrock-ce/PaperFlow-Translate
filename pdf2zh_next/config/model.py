@@ -61,22 +61,8 @@ class BasicSettings(BaseModel):
 class GUISettings(BaseModel):
     """GUI related settings"""
 
-    share: bool = Field(default=False, description="Enable sharing mode")
-    auth_file: str | None = Field(
-        default=None, description="Path to the authentication file"
-    )
-    welcome_page: str | None = Field(
-        default=None, description="Path to the welcome page html file"
-    )
-    enabled_services: str | None = Field(default=None, description="Enabled services")
-    disable_gui_sensitive_input: bool = Field(
-        default=False, description="Disable GUI sensitive input"
-    )
-    disable_config_auto_save: bool = Field(
-        default=False, description="Disable automatic saving of configuration"
-    )
     server_port: int = Field(default=7860, description="WebUI port")
-    ui_lang: str | None = Field(default="en", description="UI language")
+    ui_lang: str | None = Field(default="en", description="Default WebUI language")
 
 
 class TranslationSettings(BaseModel):

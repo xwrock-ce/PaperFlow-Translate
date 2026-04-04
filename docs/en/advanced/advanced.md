@@ -87,12 +87,6 @@ In the following table, we list all advanced options for reference:
 
 | Option                          | Function                               | Example                                         |
 | ------------------------------- | -------------------------------------- | ----------------------------------------------- |
-| `--share`                       | Enable sharing mode                    | `pdf2zh_next --gui --share`                     |
-| `--auth-file`                   | Path to the authentication file        | `pdf2zh_next --gui --auth-file /path`           |
-| `--welcome-page`                | Path to the welcome html file          | `pdf2zh_next --gui --welcome-page /path`        |
-| `--enabled-services`            | Enabled translation services           | `pdf2zh_next --gui --enabled-services "Bing,OpenAI"` |
-| `--disable-gui-sensitive-input` | Disable GUI sensitive input            | `pdf2zh_next --gui --disable-gui-sensitive-input` |
-| `--disable-config-auto-save`    | Disable automatic configuration saving | `pdf2zh_next --gui --disable-config-auto-save`  |
 | `--server-port`                 | WebUI Port                             | `pdf2zh_next --gui --server-port 7860`          |
 | `--ui-lang`                     | UI language                            | `pdf2zh_next --gui --ui-lang zh`                |
 
@@ -338,77 +332,11 @@ pdf2zh_next example.pdf --ignore-cache
 
 #### Deployment as a public services
 
-When deploying a pdf2zh GUI on public services, you should modify the configuration file as described below.
+When deploying the React WebUI on public services, start it behind your own reverse proxy and authentication layer.
 
 > [!WARNING]
 >
-> This project has not been professionally audited for security, and may contain security vulnerabilities. Please evaluate the risks and take necessary security measures before deploying on public networks.
-
-
-> [!TIP]
-> - When deploying publicly, both disable_gui_sensitive_input and disable_config_auto_save should be enabled.
-> - Separate different available services with *English commas* <kbd>,</kbd> .
-
-A usable configuration is as follows:
-
-```toml title="config.toml"
-[basic]
-gui = true
-
-[gui_settings]
-enabled_services = "Bing,OpenAI"
-disable_gui_sensitive_input = true
-disable_config_auto_save = true
-```
-
-[⬆️ Back to top](#toc)
-
----
-
-#### Authentication and welcome page
-
-When using Authentication and welcome page to specify which user to use Web UI and custom the login page:
-
-example auth.txt
-Each line contains two elements, username, and password, separated by a comma.
-
-```
-admin,123456
-user1,password1
-user2,abc123
-guest,guest123
-test,test123
-```
-
-example welcome.html
-
-```html
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Simple HTML</title>
-</head>
-<body>
-    <h1>Hello, World!</h1>
-    <p>Welcome to my simple HTML page.</p>
-</body>
-</html>
-```
-
-> [!NOTE]
-> welcome page will work if only authentication file is not blank.
-> If authentication file is blank, there will be no authentication. :)
-
-A usable configuration is as follows:
-
-```toml title="config.toml"
-[basic]
-gui = true
-
-[gui_settings]
-auth_file = "/path/to/auth/file"
-welcome_page = "/path/to/welcome/html/file"
-```
+> This project has not been professionally audited for security, and may contain security vulnerabilities. Please evaluate the risks and take necessary security measures before exposing it on public networks.
 
 [⬆️ Back to top](#toc)
 

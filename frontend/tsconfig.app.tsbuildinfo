@@ -1,0 +1,1 @@
+{"root":["./src/App.tsx","./src/main.tsx","./src/components/DownloadGrid.tsx","./src/components/FieldControl.tsx","./src/components/PreviewPanel.tsx","./src/components/ProgressPanel.tsx","./src/components/SettingsSection.tsx","./src/lib/api.ts","./src/lib/copy.ts","./src/lib/i18n.ts","./src/lib/types.ts"],"version":"5.9.3"}
