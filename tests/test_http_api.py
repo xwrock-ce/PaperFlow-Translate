@@ -257,6 +257,10 @@ def test_translate_returns_structured_success(monkeypatch, tmp_path):
     assert payload["token_usage"]["main"]["total"] == 12
     assert payload["mono_download_url"].startswith("/requests/")
     assert payload["artifacts"]["mono"]["url"] == payload["mono_download_url"]
+    assert payload["artifacts"]["mono"]["preview_url"].endswith(
+        "?disposition=inline"
+    )
+    assert payload["preview_url"] == payload["artifacts"]["mono"]["preview_url"]
 
 
 def test_translate_returns_structured_failure(monkeypatch, tmp_path):
@@ -392,6 +396,9 @@ def test_stream_translate_upload_returns_progress_and_finish(monkeypatch, tmp_pa
     assert lines[0]["stage"] == "Layout analysis"
     assert lines[1]["type"] == "finish"
     assert lines[1]["result"]["mono_download_url"].startswith("/requests/")
+    assert lines[1]["result"]["artifacts"]["mono"]["preview_url"].endswith(
+        "?disposition=inline"
+    )
 
 
 def test_stream_translate_accepts_frontend_default_blank_optionals(
@@ -454,6 +461,9 @@ def test_stream_translate_accepts_frontend_default_blank_optionals(
     lines = [json.loads(line) for line in response.text.splitlines() if line.strip()]
     assert lines[-1]["type"] == "finish"
     assert lines[-1]["result"]["mono_download_url"].startswith("/requests/")
+    assert lines[-1]["result"]["artifacts"]["mono"]["preview_url"].endswith(
+        "?disposition=inline"
+    )
 
 
 def test_download_artifact_serves_registered_output(monkeypatch, tmp_path):
@@ -499,3 +509,51 @@ def test_download_artifact_serves_registered_output(monkeypatch, tmp_path):
 
     assert download_response.status_code == 200
     assert download_response.content == b"%PDF-1.4\n"
+    assert "attachment" in download_response.headers["content-disposition"]
+
+
+def test_download_artifact_supports_inline_preview(monkeypatch, tmp_path):
+    pdf_path = _make_pdf(tmp_path)
+    mono_path = tmp_path / "paper-mono.pdf"
+    mono_path.write_bytes(b"%PDF-1.4\n")
+
+    monkeypatch.setattr(
+        "pdf2zh_next.http_api._load_base_cli_settings",
+        _base_openai_settings,
+    )
+
+    async def fake_translate_stream(_settings, _file_path, *, raise_on_error=True):
+        assert raise_on_error is False
+        yield {
+            "type": "finish",
+            "translate_result": SimpleNamespace(
+                mono_pdf_path=mono_path,
+                dual_pdf_path=None,
+                auto_extracted_glossary_path=None,
+                total_seconds=1.25,
+            ),
+            "token_usage": {"main": {"total": 12}},
+        }
+
+    monkeypatch.setattr(
+        "pdf2zh_next.http_api.do_translate_async_stream",
+        fake_translate_stream,
+    )
+
+    response = _client().post(
+        "/translate",
+        json={
+            "input_file": str(pdf_path),
+            "service": "OpenAI",
+            "lang_in": "en",
+            "lang_out": "zh",
+        },
+    )
+
+    preview_url = response.json()["artifacts"]["mono"]["preview_url"]
+    preview_response = _client().get(preview_url)
+
+    assert preview_response.status_code == 200
+    assert preview_response.content == b"%PDF-1.4\n"
+    assert "inline" in preview_response.headers["content-disposition"]
+    assert preview_response.headers["content-type"].startswith("application/pdf")

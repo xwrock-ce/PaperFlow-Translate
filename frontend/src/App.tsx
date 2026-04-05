@@ -8,7 +8,6 @@ import {
   useState,
 } from "react";
 
-import { DownloadGrid } from "./components/DownloadGrid";
 import { PreviewPanel } from "./components/PreviewPanel";
 import { SettingsSection } from "./components/SettingsSection";
 import { fetchAppConfig, streamTranslation } from "./lib/api";
@@ -59,6 +58,14 @@ interface PreviewOption {
   name: PreviewArtifactName;
   label: string;
   url: string;
+}
+
+interface DownloadOption {
+  name: string;
+  label: string;
+  url: string;
+  filename: string;
+  meta: string;
 }
 
 function readStoredLocale(): UiLocale | null {
@@ -184,7 +191,7 @@ function getSourceArtifactUrl(
   result: TranslationResult | null,
   sourcePreview: string | null,
 ): string | null {
-  return result?.artifacts?.source?.url ?? sourcePreview;
+  return result?.artifacts?.source?.preview_url ?? sourcePreview;
 }
 
 function getDefaultPreviewArtifact(
@@ -210,20 +217,23 @@ function buildPreviewOptions(
 ): PreviewOption[] {
   const options: PreviewOption[] = [];
   const sourceArtifactUrl = getSourceArtifactUrl(result, sourcePreview);
+  const monoPreviewUrl =
+    result?.artifacts?.mono?.preview_url ?? result?.preview_url ?? null;
+  const dualPreviewUrl = result?.artifacts?.dual?.preview_url ?? null;
 
-  if (result?.artifacts?.mono?.url) {
+  if (monoPreviewUrl) {
     options.push({
       name: "mono",
       label: artifactLabel("mono", locale),
-      url: result.artifacts.mono.url,
+      url: monoPreviewUrl,
     });
   }
 
-  if (result?.artifacts?.dual?.url) {
+  if (dualPreviewUrl) {
     options.push({
       name: "dual",
       label: artifactLabel("dual", locale),
-      url: result.artifacts.dual.url,
+      url: dualPreviewUrl,
     });
   }
 
@@ -236,6 +246,41 @@ function buildPreviewOptions(
   }
 
   return options;
+}
+
+const DOWNLOAD_PRIORITY: Record<string, number> = {
+  mono: 0,
+  dual: 1,
+  glossary: 2,
+};
+
+function buildDownloadOptions(
+  result: TranslationResult | null,
+  locale: UiLocale,
+  readyText: string,
+): DownloadOption[] {
+  const artifacts = result?.artifacts ? Object.values(result.artifacts) : [];
+
+  return artifacts
+    .filter((artifact) => artifact.name !== "source")
+    .sort((left, right) => {
+      const leftRank = DOWNLOAD_PRIORITY[left.name] ?? Number.MAX_SAFE_INTEGER;
+      const rightRank = DOWNLOAD_PRIORITY[right.name] ?? Number.MAX_SAFE_INTEGER;
+      if (leftRank !== rightRank) {
+        return leftRank - rightRank;
+      }
+      return left.filename.localeCompare(right.filename);
+    })
+    .map((artifact) => ({
+      name: artifact.name,
+      label: artifactLabel(artifact.name, locale),
+      url: artifact.url,
+      filename: artifact.filename,
+      meta:
+        artifact.size_bytes !== null && artifact.size_bytes !== undefined
+          ? formatBytes(artifact.size_bytes)
+          : readyText,
+    }));
 }
 
 function normalizeLanguageCode(value: string): string {
@@ -654,6 +699,7 @@ export default function App(): ReactElement {
   const activePreviewOption =
     previewOptions.find((option) => option.name === activePreviewArtifact) ?? null;
   const previewTarget = activePreviewOption?.url ?? null;
+  const downloadOptions = buildDownloadOptions(result, locale, copy.downloads.ready);
   const isTranslatedPreview =
     activePreviewArtifact === "mono" || activePreviewArtifact === "dual";
   const selectedFileSize = sourceFile ? formatBytes(sourceFile.size) : null;
@@ -1157,6 +1203,7 @@ export default function App(): ReactElement {
     <PreviewPanel
       eyebrow={copy.preview.eyebrow}
       targetLabel={copy.preview.targetLabel}
+      downloadLabel={copy.downloads.title}
       previewUrl={previewTarget}
       previewKey={activePreviewOption?.name ?? previewTarget}
       title={isTranslatedPreview ? copy.preview.translatedTitle : copy.preview.sourceTitle}
@@ -1171,21 +1218,11 @@ export default function App(): ReactElement {
       }))}
       activeOption={activePreviewArtifact}
       onSelect={handlePreviewSelect}
+      downloads={downloadOptions}
+      openDownloadLabel={copy.downloads.open}
+      emptyDownloadText={copy.downloads.empty}
       emptyTitle={copy.preview.emptyTitle}
       emptyCaption={copy.preview.emptyBody}
-    />
-  );
-
-  const downloadsPanel = (
-    <DownloadGrid
-      result={result}
-      eyebrow={copy.downloads.eyebrow}
-      title={copy.downloads.title}
-      description={copy.downloads.body}
-      emptyText={copy.downloads.empty}
-      readyText={copy.downloads.ready}
-      openText={copy.downloads.open}
-      artifactLabel={(name) => artifactLabel(name, locale)}
     />
   );
 
@@ -1224,17 +1261,14 @@ export default function App(): ReactElement {
   );
 
   const controlPanel = (
-    <section className={`panel-card launch-card control-panel status-${currentStatusTone}`}>
-      <div className="section-heading">
-        <p className="section-eyebrow">{workspaceCopy.runTitle}</p>
-        <h3>{currentWorkspaceState}</h3>
-        <p className="section-copy">{currentMessage}</p>
-      </div>
-
-      <div className="status-header">
-        <div className="status-copy">
-          <p className="status-stage">{currentStage}</p>
-          <p>{copy.launch.backendStageLabel}</p>
+    <section
+      className={`panel-card launch-card control-panel inspector-panel status-${currentStatusTone}`}
+    >
+      <div className="control-panel-top">
+        <div className="section-heading section-heading-compact">
+          <p className="section-eyebrow">{workspaceCopy.runTitle}</p>
+          <h3>{currentWorkspaceState}</h3>
+          <p className="section-copy">{currentMessage}</p>
         </div>
         <span className="status-pill">{progressPercentLabel}</span>
       </div>
@@ -1246,39 +1280,9 @@ export default function App(): ReactElement {
         />
       </div>
 
-      <div className="launch-focus">
-        <span className="summary-label">{copy.launch.sourceLabel}</span>
-        <strong>{sourceLabel}</strong>
-        <p>
-          {copy.launch.routeLabel}: {routeLabel}
-        </p>
-      </div>
-
-      <div className="meta-grid control-meta-grid">
-        <div className="meta-item">
-          <span className="meta-label">{copy.launch.engineLabel}</span>
-          <strong>{service}</strong>
-        </div>
-        <div className="meta-item">
-          <span className="meta-label">{copy.launch.pagesLabel}</span>
-          <strong>{pageScopeLabel}</strong>
-        </div>
-        <div className="meta-item">
-          <span className="meta-label">{copy.launch.outputLabel}</span>
-          <strong>{outputModeLabel}</strong>
-        </div>
-        <div className="meta-item">
-          <span className="meta-label">{workspaceCopy.previewStateLabel}</span>
-          <strong>{previewStateLabel}</strong>
-        </div>
-        <div className="meta-item">
-          <span className="meta-label">{workspaceCopy.filesLabel}</span>
-          <strong>{downloadCount}</strong>
-        </div>
-        <div className="meta-item">
-          <span className="meta-label">{copy.launch.routeLabel}</span>
-          <strong>{routeCompactLabel}</strong>
-        </div>
+      <div className="status-copy inspector-status-copy">
+        <p className="status-stage">{currentStage}</p>
+        <p>{copy.launch.backendStageLabel}</p>
       </div>
 
       {missingSecretLabels.length > 0 && service !== "SiliconFlowFree" ? (
@@ -1307,6 +1311,25 @@ export default function App(): ReactElement {
         </button>
       </div>
 
+      <div className="meta-grid inspector-meta-grid">
+        <div className="meta-item inspector-meta-item">
+          <span className="meta-label">{copy.launch.sourceLabel}</span>
+          <strong>{sourceLabel}</strong>
+        </div>
+        <div className="meta-item inspector-meta-item">
+          <span className="meta-label">{copy.launch.engineLabel}</span>
+          <strong>{service}</strong>
+        </div>
+        <div className="meta-item inspector-meta-item">
+          <span className="meta-label">{copy.launch.outputLabel}</span>
+          <strong>{outputModeLabel}</strong>
+        </div>
+        <div className="meta-item inspector-meta-item">
+          <span className="meta-label">{copy.launch.routeLabel}</span>
+          <strong>{routeCompactLabel}</strong>
+        </div>
+      </div>
+
       {currentErrorTitle ? (
         <div className="status-callout">
           <strong>{currentErrorTitle}</strong>
@@ -1321,8 +1344,8 @@ export default function App(): ReactElement {
       ) : null}
 
       {result?.token_usage ? (
-        <div className="token-card">
-          <p className="token-title">{copy.progress.tokenUsageTitle}</p>
+        <details className="technical-details">
+          <summary>{copy.progress.tokenUsageTitle}</summary>
           <div className="token-grid">
             {Object.entries(result.token_usage).map(([scope, usage]) => (
               <div key={scope} className="token-item">
@@ -1333,16 +1356,13 @@ export default function App(): ReactElement {
               </div>
             ))}
           </div>
-        </div>
+        </details>
       ) : null}
     </section>
   );
 
   const resultsPanel = (
-    <div className="results-layout">
-      <div className="results-preview-column">{previewPanel}</div>
-      <div className="results-side-column">{downloadsPanel}</div>
-    </div>
+    <div className="results-workspace">{previewPanel}</div>
   );
 
   let primaryContent: ReactElement;

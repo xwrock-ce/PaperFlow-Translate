@@ -385,7 +385,8 @@ a:focus-visible {
 }
 
 .workspace-content-results {
-  grid-template-columns: minmax(0, 1fr) 320px;
+  grid-template-columns: minmax(0, 1fr) 296px;
+  gap: 20px;
 }
 
 .utility-rail {
@@ -468,6 +469,10 @@ a:focus-visible {
 .panel-card {
   display: grid;
   gap: 20px;
+}
+
+.section-heading-compact {
+  gap: 6px;
 }
 
 .section-heading h2 {
@@ -827,7 +832,33 @@ select.field-input {
 }
 
 .launch-card {
-  gap: 18px;
+  gap: 16px;
+}
+
+.control-panel-top {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 12px;
+}
+
+.inspector-panel {
+  gap: 14px;
+}
+
+.inspector-status-copy {
+  gap: 6px;
+}
+
+.inspector-meta-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.inspector-meta-item {
+  min-height: 0;
+  padding: 14px;
+  gap: 6px;
 }
 
 .status-header {
@@ -1080,12 +1111,34 @@ select.field-input {
 }
 
 .preview-window {
-  gap: 16px;
+  gap: 18px;
+}
+
+.results-workspace {
+  min-width: 0;
+}
+
+.preview-header-shell {
+  display: grid;
+  gap: 18px;
+}
+
+.preview-toolbar-strip {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 18px;
+  align-items: end;
 }
 
 .preview-targets {
   display: grid;
   gap: 10px;
+}
+
+.preview-downloads {
+  display: grid;
+  gap: 10px;
+  justify-items: end;
 }
 
 .preview-targets-label {
@@ -1098,6 +1151,13 @@ select.field-input {
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
+}
+
+.preview-download-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  justify-content: flex-end;
 }
 
 .preview-target-button {
@@ -1129,6 +1189,49 @@ select.field-input {
   box-shadow: 0 12px 24px rgba(60, 123, 255, 0.16);
 }
 
+.preview-download-button {
+  min-height: 48px;
+  padding: 10px 14px;
+  border-radius: 18px;
+  border: 1px solid var(--border);
+  background: rgba(248, 251, 255, 0.92);
+  display: grid;
+  gap: 4px;
+  transition:
+    transform 0.18s ease,
+    border-color 0.18s ease,
+    box-shadow 0.18s ease,
+    background-color 0.18s ease;
+}
+
+.preview-download-button-primary {
+  border-color: rgba(78, 144, 255, 0.18);
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.96), rgba(235, 243, 255, 0.92));
+  box-shadow: 0 14px 28px rgba(60, 123, 255, 0.08);
+}
+
+.preview-download-button:hover {
+  transform: translateY(-1px);
+  border-color: var(--border-strong);
+  box-shadow: var(--shadow-sm);
+}
+
+.preview-download-name {
+  color: var(--ink-strong);
+  font-size: 0.84rem;
+  font-weight: 800;
+  line-height: 1.1;
+}
+
+.preview-download-meta,
+.preview-download-empty {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.78rem;
+  line-height: 1.4;
+}
+
 .preview-viewer {
   overflow: hidden;
   padding: 0;
@@ -1136,7 +1239,7 @@ select.field-input {
 }
 
 .preview-viewer-empty {
-  min-height: 520px;
+  min-height: 560px;
 }
 
 .preview-toolbar {
@@ -1175,13 +1278,13 @@ select.field-input {
 
 .preview-frame {
   width: 100%;
-  min-height: clamp(720px, 72vh, 1080px);
+  min-height: clamp(760px, 78vh, 1180px);
   border: 0;
   background: #fff;
 }
 
 .preview-empty {
-  min-height: 420px;
+  min-height: 500px;
   display: grid;
   place-content: center;
   text-align: center;
@@ -1196,7 +1299,8 @@ select.field-input {
 @media (max-width: 1280px) {
   .workspace-content,
   .workspace-content-results,
-  .results-layout {
+  .results-layout,
+  .preview-toolbar-strip {
     grid-template-columns: 1fr;
   }
 
@@ -1211,6 +1315,14 @@ select.field-input {
 
   .download-action {
     justify-self: start;
+  }
+
+  .preview-downloads {
+    justify-items: start;
+  }
+
+  .preview-download-list {
+    justify-content: flex-start;
   }
 }
 
@@ -1240,6 +1352,7 @@ select.field-input {
   .field-grid,
   .meta-grid,
   .control-meta-grid,
+  .inspector-meta-grid,
   .overview-summary-grid,
   .token-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -1278,6 +1391,7 @@ select.field-input {
   .field-grid,
   .meta-grid,
   .control-meta-grid,
+  .inspector-meta-grid,
   .overview-summary-grid,
   .action-row,
   .token-grid,
@@ -1294,8 +1408,12 @@ select.field-input {
     min-height: 0;
   }
 
+  .preview-download-button {
+    width: 100%;
+  }
+
   .preview-frame {
-    min-height: 520px;
+    min-height: 560px;
   }
 }
 
@@ -1323,6 +1441,10 @@ select.field-input {
   }
 
   .preview-viewer-empty {
+    min-height: 420px;
+  }
+
+  .preview-empty {
     min-height: 420px;
   }
 }

@@ -95,6 +95,7 @@ class TranslationArtifact(BaseModel):
     name: str
     filename: str
     url: str
+    preview_url: str | None = None
     size_bytes: int | None = None
 
 
@@ -1226,8 +1227,16 @@ def _guess_content_type(path: Path) -> str:
     return guessed or "application/octet-stream"
 
 
-def _artifact_url(request_id: str, artifact_name: str) -> str:
-    return f"/requests/{request_id}/artifacts/{artifact_name}"
+def _artifact_url(
+    request_id: str,
+    artifact_name: str,
+    *,
+    disposition: Literal["attachment", "inline"] = "attachment",
+) -> str:
+    url = f"/requests/{request_id}/artifacts/{artifact_name}"
+    if disposition == "inline":
+        return f"{url}?disposition=inline"
+    return url
 
 
 def _build_artifact(
@@ -1239,7 +1248,8 @@ def _build_artifact(
     return TranslationArtifact(
         name=name,
         filename=path.name,
-        url=_artifact_url(request_id, name),
+        url=_artifact_url(request_id, name, disposition="attachment"),
+        preview_url=_artifact_url(request_id, name, disposition="inline"),
         size_bytes=path.stat().st_size if path.exists() else None,
     )
 
@@ -1370,9 +1380,11 @@ def _build_translate_response(
             artifacts.get("glossary").url if "glossary" in artifacts else None
         ),
         preview_url=(
-            artifacts.get("mono").url
+            artifacts.get("mono").preview_url
             if "mono" in artifacts
-            else (artifacts.get("dual").url if "dual" in artifacts else None)
+            else (
+                artifacts.get("dual").preview_url if "dual" in artifacts else None
+            )
         ),
         total_seconds=getattr(result, "total_seconds", None),
         token_usage=token_usage or {},
@@ -1682,6 +1694,7 @@ def create_app(*, serve_frontend: bool = False, include_frontend: bool | None = 
     async def _download_artifact_impl(
         request_id: str,
         artifact_name: str,
+        disposition: Literal["attachment", "inline"] = "attachment",
     ) -> FileResponse:
         output_dir = _HTTP_OUTPUT_ROOT / request_id
         manifest = _read_artifact_manifest(output_dir)
@@ -1695,24 +1708,38 @@ def create_app(*, serve_frontend: bool = False, include_frontend: bool | None = 
             file_path,
             media_type=artifact.get("content_type") or _guess_content_type(file_path),
             filename=artifact.get("filename") or file_path.name,
+            content_disposition_type=disposition,
         )
 
     @app.get("/artifacts/{request_id}/{artifact_name}", tags=["artifacts"])
-    async def download_artifact(request_id: str, artifact_name: str) -> FileResponse:
-        return await _download_artifact_impl(request_id, artifact_name)
+    async def download_artifact(
+        request_id: str,
+        artifact_name: str,
+        disposition: Literal["attachment", "inline"] = "attachment",
+    ) -> FileResponse:
+        return await _download_artifact_impl(
+            request_id, artifact_name, disposition=disposition
+        )
 
     @app.get("/requests/{request_id}/artifacts/{artifact_name}", tags=["artifacts"])
     async def download_artifact_legacy(
         request_id: str,
         artifact_name: str,
+        disposition: Literal["attachment", "inline"] = "attachment",
     ) -> FileResponse:
-        return await _download_artifact_impl(request_id, artifact_name)
+        return await _download_artifact_impl(
+            request_id, artifact_name, disposition=disposition
+        )
 
     @app.get("/api/files/{request_id}/{artifact_name}", tags=["artifacts"])
     async def download_artifact_alias(
-        request_id: str, artifact_name: str
+        request_id: str,
+        artifact_name: str,
+        disposition: Literal["attachment", "inline"] = "attachment",
     ) -> FileResponse:
-        return await _download_artifact_impl(request_id, artifact_name)
+        return await _download_artifact_impl(
+            request_id, artifact_name, disposition=disposition
+        )
 
     @app.post("/translate", response_model=TranslateResponse, tags=["translation"])
     async def translate(request: TranslateRequest) -> TranslateResponse:
