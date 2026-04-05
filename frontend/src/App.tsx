@@ -22,6 +22,7 @@ import {
 import type {
   AppConfig,
   ConfigField,
+  PreviewArtifactName,
   ServiceConfig,
   SourceMode,
   TranslationResult,
@@ -52,6 +53,12 @@ interface ProgressParts {
 interface LanguageOption {
   label: string;
   value: string;
+}
+
+interface PreviewOption {
+  name: PreviewArtifactName;
+  label: string;
+  url: string;
 }
 
 function readStoredLocale(): UiLocale | null {
@@ -171,6 +178,64 @@ function formatBytes(bytes: number): string {
     return `${(bytes / 1024).toFixed(1)} KB`;
   }
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function getSourceArtifactUrl(
+  result: TranslationResult | null,
+  sourcePreview: string | null,
+): string | null {
+  return result?.artifacts?.source?.url ?? sourcePreview;
+}
+
+function getDefaultPreviewArtifact(
+  result: TranslationResult | null,
+  sourcePreview: string | null,
+): PreviewArtifactName | null {
+  if (result?.artifacts?.mono?.url) {
+    return "mono";
+  }
+  if (result?.artifacts?.dual?.url) {
+    return "dual";
+  }
+  if (getSourceArtifactUrl(result, sourcePreview)) {
+    return "source";
+  }
+  return null;
+}
+
+function buildPreviewOptions(
+  result: TranslationResult | null,
+  sourcePreview: string | null,
+  locale: UiLocale,
+): PreviewOption[] {
+  const options: PreviewOption[] = [];
+  const sourceArtifactUrl = getSourceArtifactUrl(result, sourcePreview);
+
+  if (result?.artifacts?.mono?.url) {
+    options.push({
+      name: "mono",
+      label: artifactLabel("mono", locale),
+      url: result.artifacts.mono.url,
+    });
+  }
+
+  if (result?.artifacts?.dual?.url) {
+    options.push({
+      name: "dual",
+      label: artifactLabel("dual", locale),
+      url: result.artifacts.dual.url,
+    });
+  }
+
+  if (sourceArtifactUrl) {
+    options.push({
+      name: "source",
+      label: artifactLabel("source", locale),
+      url: sourceArtifactUrl,
+    });
+  }
+
+  return options;
 }
 
 function normalizeLanguageCode(value: string): string {
@@ -446,7 +511,8 @@ export default function App(): ReactElement {
   const [parts, setParts] = useState<ProgressParts>({ current: 1, total: 1 });
   const [statusKey, setStatusKey] = useState<StatusKey>("loading");
   const [result, setResult] = useState<TranslationResult | null>(null);
-  const [previewUrl, setPreviewUrl] = useState<string | null>(null);
+  const [selectedPreviewArtifact, setSelectedPreviewArtifact] =
+    useState<PreviewArtifactName | null>(null);
   const [errorCode, setErrorCode] = useState<string | null>(null);
   const [technicalDetails, setTechnicalDetails] = useState<string | null>(null);
   const [rawStage, setRawStage] = useState<string | null>(null);
@@ -578,7 +644,18 @@ export default function App(): ReactElement {
     sourcePreviewUrl,
     fileUrl,
   );
-  const previewTarget = previewUrl ?? sourcePreview;
+  const previewOptions = buildPreviewOptions(result, sourcePreview, locale);
+  const defaultPreviewArtifact = getDefaultPreviewArtifact(result, sourcePreview);
+  const activePreviewArtifact = previewOptions.some(
+    (option) => option.name === selectedPreviewArtifact,
+  )
+    ? selectedPreviewArtifact
+    : defaultPreviewArtifact;
+  const activePreviewOption =
+    previewOptions.find((option) => option.name === activePreviewArtifact) ?? null;
+  const previewTarget = activePreviewOption?.url ?? null;
+  const isTranslatedPreview =
+    activePreviewArtifact === "mono" || activePreviewArtifact === "dual";
   const selectedFileSize = sourceFile ? formatBytes(sourceFile.size) : null;
   const missingSecretLabels = buildMissingSecretLabels(
     activeService?.fields ?? [],
@@ -648,7 +725,7 @@ export default function App(): ReactElement {
     }
 
     resetRunState("submitting");
-    setPreviewUrl(sourcePreview);
+    setSelectedPreviewArtifact(sourcePreview ? "source" : null);
 
     if (sourceMode === "upload" && !sourceFile) {
       setActiveSection("source");
@@ -720,11 +797,8 @@ export default function App(): ReactElement {
           }
 
           setResult(event.result);
-          setPreviewUrl(
-            event.result.artifacts?.mono?.url ??
-              event.result.artifacts?.dual?.url ??
-              event.result.artifacts?.source?.url ??
-              null,
+          setSelectedPreviewArtifact(
+            getDefaultPreviewArtifact(event.result, sourcePreview),
           );
           setProgress(1);
           setStatusKey("completed");
@@ -755,6 +829,10 @@ export default function App(): ReactElement {
     setLangOut(langIn);
   }
 
+  function handlePreviewSelect(name: PreviewArtifactName): void {
+    setSelectedPreviewArtifact(name);
+  }
+
   const noEngineFields = activeTab === "engine" && !activeTabFields.length;
   const progressPercentLabel = `${Math.max(
     0,
@@ -765,9 +843,10 @@ export default function App(): ReactElement {
         (artifact) => artifact.name !== "source",
       ).length
     : 0;
-  const previewStateLabel = previewTarget
-    ? copy.source.previewReady
-    : copy.source.previewWaiting;
+  const previewStateLabel =
+    activePreviewArtifact && previewTarget
+      ? artifactLabel(activePreviewArtifact, locale)
+      : copy.source.previewWaiting;
   const currentErrorTitle =
     statusKey === "failed" || statusKey === "config_unavailable"
       ? copy.progress.errorTitles[
@@ -1077,9 +1156,21 @@ export default function App(): ReactElement {
   const previewPanel = (
     <PreviewPanel
       eyebrow={copy.preview.eyebrow}
+      targetLabel={copy.preview.targetLabel}
       previewUrl={previewTarget}
-      title={result ? copy.preview.translatedTitle : copy.preview.sourceTitle}
-      caption={result ? copy.preview.translatedBody : copy.preview.sourceBody}
+      previewKey={activePreviewOption?.name ?? previewTarget}
+      title={isTranslatedPreview ? copy.preview.translatedTitle : copy.preview.sourceTitle}
+      caption={isTranslatedPreview ? copy.preview.translatedBody : copy.preview.sourceBody}
+      viewerTitle={
+        activePreviewOption?.label ??
+        (isTranslatedPreview ? copy.preview.translatedTitle : copy.preview.sourceTitle)
+      }
+      options={previewOptions.map((option) => ({
+        name: option.name,
+        label: option.label,
+      }))}
+      activeOption={activePreviewArtifact}
+      onSelect={handlePreviewSelect}
       emptyTitle={copy.preview.emptyTitle}
       emptyCaption={copy.preview.emptyBody}
     />
@@ -1093,6 +1184,7 @@ export default function App(): ReactElement {
       description={copy.downloads.body}
       emptyText={copy.downloads.empty}
       readyText={copy.downloads.ready}
+      openText={copy.downloads.open}
       artifactLabel={(name) => artifactLabel(name, locale)}
     />
   );

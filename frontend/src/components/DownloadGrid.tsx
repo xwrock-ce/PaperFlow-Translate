@@ -9,8 +9,15 @@ interface DownloadGridProps {
   description: string;
   emptyText: string;
   readyText: string;
+  openText: string;
   artifactLabel: (name: string) => string;
 }
+
+const DOWNLOAD_PRIORITY: Record<string, number> = {
+  mono: 0,
+  dual: 1,
+  glossary: 2,
+};
 
 function formatBytes(bytes?: number | null): string | null {
   if (!bytes) {
@@ -32,12 +39,21 @@ export function DownloadGrid({
   description,
   emptyText,
   readyText,
+  openText,
   artifactLabel,
 }: DownloadGridProps): ReactElement {
   const artifacts = result?.artifacts ? Object.values(result.artifacts) : [];
-  const downloadableArtifacts = artifacts.filter(
-    (artifact) => artifact.name !== "source",
-  );
+  const downloadableArtifacts = artifacts
+    .filter((artifact) => artifact.name !== "source")
+    .sort((left, right) => {
+      const leftRank = DOWNLOAD_PRIORITY[left.name] ?? Number.MAX_SAFE_INTEGER;
+      const rightRank = DOWNLOAD_PRIORITY[right.name] ?? Number.MAX_SAFE_INTEGER;
+      if (leftRank !== rightRank) {
+        return leftRank - rightRank;
+      }
+      return left.filename.localeCompare(right.filename);
+    });
+  const [primaryArtifact, ...secondaryArtifacts] = downloadableArtifacts;
 
   return (
     <section className="panel-card downloads-card">
@@ -46,21 +62,46 @@ export function DownloadGrid({
         <h3>{title}</h3>
         <p className="section-copy">{description}</p>
       </div>
-      {downloadableArtifacts.length ? (
-        <div className="download-grid">
-          {downloadableArtifacts.map((artifact) => (
-            <a
-              key={artifact.name}
-              className="download-tile"
-              href={artifact.url}
-              target="_blank"
-              rel="noreferrer"
-            >
-              <span className="download-kicker">{artifactLabel(artifact.name)}</span>
-              <strong>{artifact.filename}</strong>
-              <span>{formatBytes(artifact.size_bytes) ?? readyText}</span>
-            </a>
-          ))}
+      {primaryArtifact ? (
+        <div className="download-stack">
+          <a
+            className="download-primary"
+            href={primaryArtifact.url}
+            target="_blank"
+            rel="noreferrer"
+          >
+            <div className="download-primary-copy">
+              <span className="download-kicker">
+                {artifactLabel(primaryArtifact.name)}
+              </span>
+              <strong>{primaryArtifact.filename}</strong>
+              <span>{formatBytes(primaryArtifact.size_bytes) ?? readyText}</span>
+            </div>
+            <span className="download-action">{openText}</span>
+          </a>
+
+          {secondaryArtifacts.length ? (
+            <div className="download-list">
+              {secondaryArtifacts.map((artifact) => (
+                <a
+                  key={artifact.name}
+                  className="download-list-item"
+                  href={artifact.url}
+                  target="_blank"
+                  rel="noreferrer"
+                >
+                  <div className="download-list-copy">
+                    <span className="download-kicker">
+                      {artifactLabel(artifact.name)}
+                    </span>
+                    <strong>{artifact.filename}</strong>
+                    <span>{formatBytes(artifact.size_bytes) ?? readyText}</span>
+                  </div>
+                  <span className="download-action">{openText}</span>
+                </a>
+              ))}
+            </div>
+          ) : null}
         </div>
       ) : (
         <div className="download-empty">
