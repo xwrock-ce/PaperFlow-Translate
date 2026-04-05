@@ -32,20 +32,19 @@ export function SettingsSection({
   values,
   onChange,
 }: SettingsSectionProps): ReactElement {
-  void title;
   void eyebrow;
   void description;
 
   if (!fields.length) {
     return (
-      <section className="settings-card">
+      <section className="settings-card" aria-label={title}>
         {emptyMessage ? <p className="section-copy">{emptyMessage}</p> : null}
       </section>
     );
   }
 
   return (
-    <section className="settings-card">
+    <section className="settings-card" aria-label={title}>
       <div className="field-grid">
         {fields.map((field) => (
           <FieldControl

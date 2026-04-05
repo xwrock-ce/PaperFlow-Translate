@@ -961,6 +961,20 @@ export default function App(): ReactElement {
   const activeSectionMeta =
     workspaceSections.find((section) => section.id === activeSection) ??
     workspaceSections[0];
+  const headerHighlights = [
+    {
+      label: copy.launch.routeLabel,
+      value: routeCompactLabel,
+    },
+    {
+      label: copy.launch.engineLabel,
+      value: service,
+    },
+    {
+      label: copy.launch.sourceLabel,
+      value: sourceReady ? sourceLabel : sourceTransportLabel,
+    },
+  ];
 
   function renderRouteVisual(extraClassName?: string): ReactElement {
     return (
@@ -1039,7 +1053,7 @@ export default function App(): ReactElement {
         </label>
       )}
 
-      <div className="meta-grid">
+      <div className="meta-grid source-meta-grid">
         <div className="meta-item">
           <span className="meta-label">{copy.source.previewLabel}</span>
           <strong>{previewStateLabel}</strong>
@@ -1062,6 +1076,26 @@ export default function App(): ReactElement {
         <p className="section-eyebrow">{copy.route.eyebrow}</p>
         <h2>{copy.route.title}</h2>
         <p className="section-copy">{copy.route.body}</p>
+      </div>
+
+      <div className="route-overview">
+        <div className="overview-route-shell route-overview-shell">
+          <span className="hero-card-label">{copy.launch.routeLabel}</span>
+          {renderRouteVisual("route-visual-hero")}
+        </div>
+
+        <div className="service-banner route-service-note">
+          <span className="service-banner-title">
+            {service === "SiliconFlowFree"
+              ? copy.route.freeEngineTitle
+              : copy.route.privateEngineTitle}
+          </span>
+          <p>
+            {service === "SiliconFlowFree"
+              ? copy.route.freeEngineBody
+              : copy.route.privateEngineBody}
+          </p>
+        </div>
       </div>
 
       <div className="route-language-grid">
@@ -1105,35 +1139,20 @@ export default function App(): ReactElement {
         </label>
       </div>
 
-      <div className="route-service-grid">
-        <label className="field route-service-field">
-          <span className="field-label">{copy.route.service}</span>
-          <select
-            className="field-input"
-            value={service}
-            onChange={(event) => handleServiceChange(event.target.value)}
-          >
-            {appConfig.services.map((item) => (
-              <option key={item.name} value={item.name}>
-                {item.name}
-              </option>
-            ))}
-          </select>
-        </label>
-
-        <div className="service-banner">
-          <span className="service-banner-title">
-            {service === "SiliconFlowFree"
-              ? copy.route.freeEngineTitle
-              : copy.route.privateEngineTitle}
-          </span>
-          <p>
-            {service === "SiliconFlowFree"
-              ? copy.route.freeEngineBody
-              : copy.route.privateEngineBody}
-          </p>
-        </div>
-      </div>
+      <label className="field route-service-field">
+        <span className="field-label">{copy.route.service}</span>
+        <select
+          className="field-input"
+          value={service}
+          onChange={(event) => handleServiceChange(event.target.value)}
+        >
+          {appConfig.services.map((item) => (
+            <option key={item.name} value={item.name}>
+              {item.name}
+            </option>
+          ))}
+        </select>
+      </label>
     </section>
   );
 
@@ -1227,11 +1246,19 @@ export default function App(): ReactElement {
   );
 
   const overviewPanel = (
-    <section className="panel-card overview-panel">
-      <div className="overview-copy">
-        <p className="section-eyebrow">{workspaceCopy.nav.overview}</p>
-        <h2>{currentWorkspaceState}</h2>
-        <p className="section-copy">{currentMessage}</p>
+    <section className="panel-card overview-panel workspace-panel">
+      <div className="overview-hero">
+        <div className="overview-copy">
+          <p className="section-eyebrow">{workspaceCopy.nav.overview}</p>
+          <h2>{currentWorkspaceState}</h2>
+          <p className="section-copy">{currentMessage}</p>
+        </div>
+
+        <div className="launch-focus">
+          <span className="summary-label">{copy.launch.backendStageLabel}</span>
+          <strong>{currentStage}</strong>
+          <p>{currentMessage}</p>
+        </div>
       </div>
 
       <div className="overview-route-shell">
@@ -1387,83 +1414,98 @@ export default function App(): ReactElement {
   }
 
   return (
-    <div className="app-shell app-workbench">
-      <aside className="app-sidebar">
-        <div className="sidebar-brand">
-          <div className="sidebar-brand-mark">PF</div>
-          <div className="sidebar-brand-copy">
-            <strong>{copy.appName}</strong>
-            <span>{currentWorkspaceState}</span>
-          </div>
-        </div>
-
-        <nav className="sidebar-nav" aria-label={workspaceCopy.nav.overview}>
-          {workspaceSections.map((section) => (
-            <button
-              key={section.id}
-              className={`sidebar-nav-item${activeSection === section.id ? " sidebar-nav-item-active" : ""}`}
-              type="button"
-              onClick={() => setActiveSection(section.id)}
-            >
-              <span className="sidebar-nav-key">{section.key}</span>
-              <span className="sidebar-nav-copy">
-                <strong>{section.label}</strong>
-                <span>{section.detail}</span>
-              </span>
-              {section.badge ? (
-                <span className="sidebar-nav-badge">{section.badge}</span>
-              ) : null}
-            </button>
-          ))}
-        </nav>
-
-        <div className="sidebar-footer">
-          <span className="section-eyebrow">{workspaceCopy.contextTitle}</span>
-          <strong>{routeLabel}</strong>
-          <p>{service}</p>
-        </div>
-      </aside>
-
-      <main className="app-workspace">
-        <header className="workspace-header">
-          <div className="workspace-header-copy">
-            <p className="section-eyebrow">{copy.appName}</p>
-            <h1>{activeSectionMeta.title}</h1>
-            <p className="header-body">{activeSectionMeta.description}</p>
+    <div className="app-shell">
+      <div className="app-workbench">
+        <aside className="app-sidebar">
+          <div className="sidebar-brand">
+            <div className="sidebar-brand-mark">PF</div>
+            <div className="sidebar-brand-copy">
+              <strong>{copy.appName}</strong>
+              <span>{currentWorkspaceState}</span>
+            </div>
           </div>
 
-          <div className="workspace-header-side">
-            <section className="locale-card" aria-label={copy.localeLabel}>
-              <span className="locale-label">{copy.localeLabel}</span>
-              <div className="locale-toggle">
-                <button
-                  className={locale === "en" ? "toggle-active" : undefined}
-                  type="button"
-                  onClick={() => setLocale("en")}
-                >
-                  {copy.localeOptions.en}
-                </button>
-                <button
-                  className={locale === "zh" ? "toggle-active" : undefined}
-                  type="button"
-                  onClick={() => setLocale("zh")}
-                >
-                  {copy.localeOptions.zh}
-                </button>
+          <nav className="sidebar-nav" aria-label={workspaceCopy.nav.overview}>
+            {workspaceSections.map((section) => (
+              <button
+                key={section.id}
+                className={`sidebar-nav-item${activeSection === section.id ? " sidebar-nav-item-active" : ""}`}
+                type="button"
+                onClick={() => setActiveSection(section.id)}
+              >
+                <span className="sidebar-nav-key">{section.key}</span>
+                <span className="sidebar-nav-copy">
+                  <strong>{section.label}</strong>
+                  <span>{section.detail}</span>
+                </span>
+                {section.badge ? (
+                  <span className="sidebar-nav-badge">{section.badge}</span>
+                ) : null}
+              </button>
+            ))}
+          </nav>
+
+          <div className="sidebar-footer">
+            <span className="section-eyebrow">{workspaceCopy.contextTitle}</span>
+            <strong>{routeLabel}</strong>
+            <p>{service}</p>
+          </div>
+        </aside>
+
+        <main className="app-workspace">
+          <header className="workspace-header">
+            <div className="workspace-header-copy">
+              <p className="section-eyebrow">{copy.appName}</p>
+              <h1>{activeSectionMeta.title}</h1>
+              <p className="header-body">{activeSectionMeta.description}</p>
+
+              <div className="workspace-header-highlights">
+                {headerHighlights.map((item) => (
+                  <div key={item.label} className="workspace-highlight">
+                    <span className="meta-label">{item.label}</span>
+                    <strong>{item.value}</strong>
+                  </div>
+                ))}
               </div>
-            </section>
-          </div>
-        </header>
+            </div>
 
-        <div
-          className={`workspace-content${activeSection === "results" ? " workspace-content-results" : ""}`}
-        >
-          <section className="workspace-primary">{primaryContent}</section>
-          <aside className="workspace-secondary">
-            <div className="utility-rail">{controlPanel}</div>
-          </aside>
-        </div>
-      </main>
+            <div className="workspace-header-side">
+              <span className={`workspace-status-chip workspace-status-chip-${currentStatusTone}`}>
+                {currentWorkspaceState}
+              </span>
+
+              <section className="locale-card" aria-label={copy.localeLabel}>
+                <span className="locale-label">{copy.localeLabel}</span>
+                <div className="locale-toggle">
+                  <button
+                    className={locale === "en" ? "toggle-active" : undefined}
+                    type="button"
+                    onClick={() => setLocale("en")}
+                  >
+                    {copy.localeOptions.en}
+                  </button>
+                  <button
+                    className={locale === "zh" ? "toggle-active" : undefined}
+                    type="button"
+                    onClick={() => setLocale("zh")}
+                  >
+                    {copy.localeOptions.zh}
+                  </button>
+                </div>
+              </section>
+            </div>
+          </header>
+
+          <div
+            className={`workspace-content${activeSection === "results" ? " workspace-content-results" : ""}`}
+          >
+            <section className="workspace-primary">{primaryContent}</section>
+            <aside className="workspace-secondary">
+              <div className="utility-rail">{controlPanel}</div>
+            </aside>
+          </div>
+        </main>
+      </div>
     </div>
   );
 }

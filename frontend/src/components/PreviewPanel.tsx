@@ -95,8 +95,11 @@ export function PreviewPanel({
                     title={download.filename}
                     aria-label={`${openDownloadLabel}: ${download.filename}`}
                   >
-                    <span className="preview-download-name">{download.label}</span>
-                    <span className="preview-download-meta">{download.meta}</span>
+                    <span className="preview-download-copy">
+                      <span className="preview-download-name">{download.label}</span>
+                      <span className="preview-download-meta">{download.meta}</span>
+                    </span>
+                    <span className="preview-download-open">{openDownloadLabel}</span>
                   </a>
                 ))}
               </div>

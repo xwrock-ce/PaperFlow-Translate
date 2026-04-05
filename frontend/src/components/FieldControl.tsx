@@ -36,18 +36,30 @@ export function FieldControl({
   onChange,
 }: FieldControlProps): ReactElement {
   const fieldLabel = resolveText(field.label, locale) || field.name;
+  const fieldDescription = field.description
+    ? resolveText(field.description, locale)
+    : "";
   const placeholder = field.password
     ? labels.leaveBlank
     : field.required
       ? labels.required
       : labels.optional;
-  const commonHint = field.description ? (
-    <p className="field-hint">{resolveText(field.description, locale)}</p>
+  const commonHint = fieldDescription ? (
+    <p className="field-hint">{fieldDescription}</p>
   ) : null;
+  const fieldClassName = `field${
+    field.type === "boolean" ? " field-toggle" : ""
+  }${field.type === "select" ? " field-choice" : ""}${
+    field.password ? " field-sensitive" : ""
+  }${
+    field.type !== "boolean" && fieldDescription.length > 120
+      ? " field-span-full"
+      : ""
+  }`;
 
   if (field.type === "boolean") {
     return (
-      <label className="field field-toggle">
+      <label className={fieldClassName}>
         <span className="field-copy">
           <span className="field-label">{fieldLabel}</span>
           {commonHint}
@@ -64,7 +76,7 @@ export function FieldControl({
 
   if (field.type === "select" && field.choices?.length) {
     return (
-      <label className="field">
+      <label className={fieldClassName}>
         <span className="field-label">{fieldLabel}</span>
         <select
           className="field-input"
@@ -84,7 +96,7 @@ export function FieldControl({
   }
 
   return (
-    <label className="field">
+    <label className={fieldClassName}>
       <span className="field-label">{fieldLabel}</span>
       <input
         className="field-input"
