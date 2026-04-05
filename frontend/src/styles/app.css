@@ -143,10 +143,10 @@ a:focus-visible {
 }
 
 .app-shell {
-  max-width: 1460px;
+  max-width: 1760px;
   min-height: 100vh;
   margin: 0 auto;
-  padding: 26px 22px 56px;
+  padding: 26px clamp(18px, 2.6vw, 38px) 56px;
 }
 
 .loading-card,
@@ -486,14 +486,22 @@ a:focus-visible {
 .top-grid,
 .workspace-grid {
   display: grid;
-  grid-template-columns: minmax(0, 1.42fr) minmax(340px, 0.88fr);
   gap: 20px;
   align-items: start;
+}
+
+.top-grid {
+  grid-template-columns: minmax(0, 1.46fr) minmax(360px, 0.9fr);
+}
+
+.workspace-grid {
+  grid-template-columns: minmax(380px, 0.88fr) minmax(0, 1.32fr);
 }
 
 .top-grid-main,
 .workspace-main,
 .workspace-side,
+.workspace-support-grid,
 .settings-board,
 .downloads-card,
 .preview-card,
@@ -508,6 +516,11 @@ a:focus-visible {
 
 .workspace-main {
   grid-template-columns: minmax(0, 1fr);
+}
+
+.workspace-support-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  align-content: start;
 }
 
 .panel-card {
@@ -532,6 +545,10 @@ a:focus-visible {
 .route-card,
 .settings-board {
   align-content: start;
+}
+
+.settings-board {
+  min-width: 0;
 }
 
 .source-card {
@@ -917,8 +934,13 @@ select.field-input {
 }
 
 .workspace-side {
+  min-width: 0;
+}
+
+.workspace-preview-column {
   position: sticky;
   top: 22px;
+  align-self: start;
 }
 
 .settings-board {
@@ -1098,7 +1120,7 @@ select.field-input {
 
 .preview-frame {
   width: 100%;
-  min-height: 680px;
+  min-height: clamp(760px, 78vh, 1160px);
   border: 0;
   border-radius: 24px;
   background: rgba(255, 255, 255, 0.94);
@@ -1106,7 +1128,7 @@ select.field-input {
 }
 
 .preview-empty {
-  min-height: 280px;
+  min-height: clamp(460px, 54vh, 680px);
   place-content: center;
   padding: 26px;
   border-radius: 24px;
@@ -1121,12 +1143,13 @@ select.field-input {
   .app-header,
   .top-grid,
   .top-grid-main,
+  .workspace-main,
   .workspace-grid {
     grid-template-columns: 1fr;
   }
 
   .launch-card,
-  .workspace-side {
+  .workspace-preview-column {
     position: static;
   }
 }
@@ -1151,6 +1174,7 @@ select.field-input {
   .header-metrics,
   .hero-facts,
   .launch-summary,
+  .workspace-support-grid,
   .meta-grid,
   .route-grid,
   .route-service-grid,

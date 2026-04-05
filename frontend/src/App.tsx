@@ -1126,47 +1126,48 @@ export default function App(): ReactElement {
               }}
             />
           </section>
+          <div className="workspace-support-grid">
+            <ProgressPanel
+              eyebrow={copy.progress.eyebrow}
+              title={copy.progress.titles[currentStatusTone]}
+              stage={currentStage}
+              message={currentMessage}
+              progress={progress}
+              progressLabel={`${Math.max(0, Math.min(100, Math.round(progress * 100)))}%`}
+              statusTone={currentStatusTone}
+              result={result}
+              errorTitle={
+                statusKey === "failed" || statusKey === "config_unavailable"
+                  ? copy.progress.errorTitles[
+                      (errorCode as keyof typeof copy.progress.errorTitles) ?? "default"
+                    ] ?? copy.progress.errorTitles.default
+                  : null
+              }
+              technicalDetailsLabel={copy.launch.technicalDetails}
+              technicalDetails={technicalState}
+              meta={[
+                { label: copy.progress.meta.engine, value: service },
+                { label: copy.progress.meta.route, value: routeLabel },
+                { label: copy.progress.meta.pages, value: pageScopeLabel },
+                { label: copy.progress.meta.output, value: outputModeLabel },
+              ]}
+              tokenUsageTitle={copy.progress.tokenUsageTitle}
+              tokenTotalSuffix={copy.progress.tokenTotalSuffix}
+            />
+
+            <DownloadGrid
+              result={result}
+              eyebrow={copy.downloads.eyebrow}
+              title={copy.downloads.title}
+              description={copy.downloads.body}
+              emptyText={copy.downloads.empty}
+              readyText={copy.downloads.ready}
+              artifactLabel={(name) => artifactLabel(name, locale)}
+            />
+          </div>
         </div>
 
-        <aside className="workspace-side">
-          <ProgressPanel
-            eyebrow={copy.progress.eyebrow}
-            title={copy.progress.titles[currentStatusTone]}
-            stage={currentStage}
-            message={currentMessage}
-            progress={progress}
-            progressLabel={`${Math.max(0, Math.min(100, Math.round(progress * 100)))}%`}
-            statusTone={currentStatusTone}
-            result={result}
-            errorTitle={
-              statusKey === "failed" || statusKey === "config_unavailable"
-                ? copy.progress.errorTitles[
-                    (errorCode as keyof typeof copy.progress.errorTitles) ?? "default"
-                  ] ?? copy.progress.errorTitles.default
-                : null
-            }
-            technicalDetailsLabel={copy.launch.technicalDetails}
-            technicalDetails={technicalState}
-            meta={[
-              { label: copy.progress.meta.engine, value: service },
-              { label: copy.progress.meta.route, value: routeLabel },
-              { label: copy.progress.meta.pages, value: pageScopeLabel },
-              { label: copy.progress.meta.output, value: outputModeLabel },
-            ]}
-            tokenUsageTitle={copy.progress.tokenUsageTitle}
-            tokenTotalSuffix={copy.progress.tokenTotalSuffix}
-          />
-
-          <DownloadGrid
-            result={result}
-            eyebrow={copy.downloads.eyebrow}
-            title={copy.downloads.title}
-            description={copy.downloads.body}
-            emptyText={copy.downloads.empty}
-            readyText={copy.downloads.ready}
-            artifactLabel={(name) => artifactLabel(name, locale)}
-          />
-
+        <aside className="workspace-side workspace-preview-column">
           <PreviewPanel
             eyebrow={copy.preview.eyebrow}
             previewUrl={previewTarget}
