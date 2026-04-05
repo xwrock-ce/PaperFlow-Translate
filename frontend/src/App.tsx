@@ -10,7 +10,6 @@ import {
 
 import { DownloadGrid } from "./components/DownloadGrid";
 import { PreviewPanel } from "./components/PreviewPanel";
-import { ProgressPanel } from "./components/ProgressPanel";
 import { SettingsSection } from "./components/SettingsSection";
 import { fetchAppConfig, streamTranslation } from "./lib/api";
 import {
@@ -31,6 +30,7 @@ import type {
 
 type FieldValues = Record<string, string | number | boolean | null>;
 type SettingsTab = "engine" | "translation" | "pdf";
+type WorkspaceSection = "overview" | "source" | "route" | "settings" | "results";
 type StatusKey =
   | "loading"
   | "intro"
@@ -209,7 +209,9 @@ function chooseLanguageCode(
 ): string {
   for (const candidate of candidates) {
     const exact = options.find(
-      (option) => normalizeLanguageCode(option.value) === normalizeLanguageCode(candidate),
+      (option) =>
+        normalizeLanguageCode(option.value) ===
+        normalizeLanguageCode(candidate),
     );
     if (exact) {
       return exact.value;
@@ -218,7 +220,9 @@ function chooseLanguageCode(
 
   for (const candidate of candidates) {
     const prefix = options.find((option) =>
-      normalizeLanguageCode(option.value).startsWith(normalizeLanguageCode(candidate)),
+      normalizeLanguageCode(option.value).startsWith(
+        normalizeLanguageCode(candidate),
+      ),
     );
     if (prefix) {
       return prefix.value;
@@ -228,10 +232,7 @@ function chooseLanguageCode(
   return options[0]?.value ?? "";
 }
 
-function languageLabel(
-  options: LanguageOption[],
-  value: string,
-): string {
+function languageLabel(options: LanguageOption[], value: string): string {
   return options.find((option) => option.value === value)?.label || value;
 }
 
@@ -439,6 +440,8 @@ export default function App(): ReactElement {
   const [pdfValues, setPdfValues] = useState<FieldValues>({});
   const [engineValues, setEngineValues] = useState<FieldValues>({});
   const [activeTab, setActiveTab] = useState<SettingsTab>("engine");
+  const [activeSection, setActiveSection] =
+    useState<WorkspaceSection>("overview");
   const [progress, setProgress] = useState(0);
   const [parts, setParts] = useState<ProgressParts>({ current: 1, total: 1 });
   const [statusKey, setStatusKey] = useState<StatusKey>("loading");
@@ -468,18 +471,13 @@ export default function App(): ReactElement {
           nextConfig.translation_languages,
           nextLocale,
         );
+
         startTransition(() => {
           setLocale(nextLocale);
           setConfig(nextConfig);
           setService(initialService);
           setLangIn(chooseLanguageCode(nextLanguageOptions, "en"));
-          setLangOut(
-            chooseLanguageCode(
-              nextLanguageOptions,
-              "zh-CN",
-              "zh",
-            ),
-          );
+          setLangOut(chooseLanguageCode(nextLanguageOptions, "zh-CN", "zh"));
           setTranslationValues(buildDefaultValues(nextConfig.translation_fields));
           setPdfValues(buildDefaultValues(nextConfig.pdf_fields));
           setEngineValues(
@@ -513,7 +511,10 @@ export default function App(): ReactElement {
       return;
     }
 
-    const nextOptions = normalizeLanguageOptions(config.translation_languages, locale);
+    const nextOptions = normalizeLanguageOptions(
+      config.translation_languages,
+      locale,
+    );
     if (!nextOptions.length) {
       return;
     }
@@ -650,16 +651,19 @@ export default function App(): ReactElement {
     setPreviewUrl(sourcePreview);
 
     if (sourceMode === "upload" && !sourceFile) {
+      setActiveSection("source");
       setStatusKey("source_missing_upload");
       return;
     }
 
     if (sourceMode === "link" && !fileUrl.trim()) {
+      setActiveSection("source");
       setStatusKey("source_missing_link");
       return;
     }
 
     if (service !== "SiliconFlowFree" && missingSecretLabels.length > 0) {
+      setActiveSection("settings");
       setStatusKey("credentials_required");
       return;
     }
@@ -667,6 +671,7 @@ export default function App(): ReactElement {
     const controller = new AbortController();
     controllerRef.current = controller;
     setIsRunning(true);
+    setActiveSection("overview");
 
     try {
       await streamTranslation(
@@ -725,6 +730,7 @@ export default function App(): ReactElement {
           setStatusKey("completed");
           setIsRunning(false);
           controllerRef.current = null;
+          setActiveSection("results");
         },
       );
     } catch (streamError) {
@@ -750,434 +756,602 @@ export default function App(): ReactElement {
   }
 
   const noEngineFields = activeTab === "engine" && !activeTabFields.length;
+  const progressPercentLabel = `${Math.max(
+    0,
+    Math.min(100, Math.round(progress * 100)),
+  )}%`;
+  const downloadCount = result?.artifacts
+    ? Object.values(result.artifacts).filter(
+        (artifact) => artifact.name !== "source",
+      ).length
+    : 0;
+  const previewStateLabel = previewTarget
+    ? copy.source.previewReady
+    : copy.source.previewWaiting;
+  const currentErrorTitle =
+    statusKey === "failed" || statusKey === "config_unavailable"
+      ? copy.progress.errorTitles[
+          (errorCode as keyof typeof copy.progress.errorTitles) ?? "default"
+        ] ?? copy.progress.errorTitles.default
+      : null;
+  const workspaceCopy = copy.workspace;
+  const routeCompactLabel = `${langInLabel} → ${langOutLabel}`;
+  const workspaceSections: Array<{
+    id: WorkspaceSection;
+    key: string;
+    label: string;
+    title: string;
+    description: string;
+    detail: string;
+    badge: string | null;
+  }> = [
+    {
+      id: "overview",
+      key: "01",
+      label: workspaceCopy.nav.overview,
+      title: workspaceCopy.titles.overview,
+      description: workspaceCopy.descriptions.overview,
+      detail: currentWorkspaceState,
+      badge: currentStatusTone === "active" ? progressPercentLabel : null,
+    },
+    {
+      id: "source",
+      key: "02",
+      label: workspaceCopy.nav.source,
+      title: workspaceCopy.titles.source,
+      description: workspaceCopy.descriptions.source,
+      detail: sourceTransportLabel,
+      badge: sourceReady ? copy.source.previewReady : null,
+    },
+    {
+      id: "route",
+      key: "03",
+      label: workspaceCopy.nav.route,
+      title: workspaceCopy.titles.route,
+      description: workspaceCopy.descriptions.route,
+      detail: routeCompactLabel,
+      badge: null,
+    },
+    {
+      id: "settings",
+      key: "04",
+      label: workspaceCopy.nav.settings,
+      title: workspaceCopy.titles.settings,
+      description: workspaceCopy.descriptions.settings,
+      detail: copy.settings.tabs[activeTab],
+      badge: activeService?.fields.length ? String(activeService.fields.length) : null,
+    },
+    {
+      id: "results",
+      key: "05",
+      label: workspaceCopy.nav.results,
+      title: workspaceCopy.titles.results,
+      description: workspaceCopy.descriptions.results,
+      detail: downloadCount
+        ? `${downloadCount} ${workspaceCopy.filesLabel}`
+        : previewStateLabel,
+      badge: downloadCount ? String(downloadCount) : null,
+    },
+  ];
+  const activeSectionMeta =
+    workspaceSections.find((section) => section.id === activeSection) ??
+    workspaceSections[0];
 
-  return (
-    <div className="app-shell">
-      <header className="app-header">
-        <div className="header-copy">
-          <p className="section-eyebrow">{copy.appName}</p>
-          <h1>{copy.headerTitle}</h1>
-          <p className="header-body">{copy.headerBody}</p>
-          <div className="header-metrics">
-            <div className="header-metric">
-              <span className="summary-label">{copy.launch.stateLabel}</span>
-              <strong>{currentWorkspaceState}</strong>
-            </div>
-            <div className="header-metric">
-              <span className="summary-label">{copy.launch.sourceLabel}</span>
-              <strong>{sourceLabel}</strong>
-            </div>
-            <div className="header-metric header-metric-wide">
-              <span className="summary-label">{copy.launch.routeLabel}</span>
-              <strong>{routeLabel}</strong>
-            </div>
-          </div>
+  function renderRouteVisual(extraClassName?: string): ReactElement {
+    return (
+      <div
+        className={`route-visual${extraClassName ? ` ${extraClassName}` : ""}`}
+        aria-label={routeLabel}
+      >
+        <span className="route-visual-chip">{langInLabel}</span>
+        <span className="route-visual-arrow" aria-hidden="true">
+          →
+        </span>
+        <span className="route-visual-chip">{langOutLabel}</span>
+      </div>
+    );
+  }
+
+  const sourcePanel = (
+    <section className="panel-card source-card workspace-panel">
+      <div className="section-heading">
+        <p className="section-eyebrow">{copy.source.eyebrow}</p>
+        <h2>{copy.source.title}</h2>
+        <p className="section-copy">{copy.source.body}</p>
+      </div>
+
+      <div className="mode-toggle">
+        <button
+          className={sourceMode === "upload" ? "mode-active" : undefined}
+          type="button"
+          onClick={() => setSourceMode("upload")}
+        >
+          {copy.source.uploadMode}
+        </button>
+        <button
+          className={sourceMode === "link" ? "mode-active" : undefined}
+          type="button"
+          onClick={() => setSourceMode("link")}
+        >
+          {copy.source.linkMode}
+        </button>
+      </div>
+
+      {sourceMode === "upload" ? (
+        <label className="upload-dropzone">
+          <span className="upload-title">
+            {sourceFile?.name ?? copy.source.uploadEmptyTitle}
+          </span>
+          <span className="upload-copy">
+            {sourceFile
+              ? `${copy.source.uploadSelectedPrefix}${selectedFileSize ? `, ${selectedFileSize}` : ""}.`
+              : copy.source.uploadEmptyBody}
+          </span>
+          <span className="upload-cta">{copy.source.uploadMode}</span>
+          <input
+            accept="application/pdf,.pdf"
+            type="file"
+            onChange={(event) => {
+              setSourceFile(event.target.files?.[0] ?? null);
+              setStatusKey("intro");
+            }}
+          />
+        </label>
+      ) : (
+        <label className="field">
+          <span className="field-label">{copy.source.directUrlLabel}</span>
+          <input
+            className="field-input"
+            placeholder={copy.source.directUrlPlaceholder}
+            type="url"
+            value={fileUrl}
+            onChange={(event) => {
+              setFileUrl(event.target.value);
+              setStatusKey("intro");
+            }}
+          />
+          <p className="field-hint">{copy.source.directUrlHint}</p>
+        </label>
+      )}
+
+      <div className="meta-grid">
+        <div className="meta-item">
+          <span className="meta-label">{copy.source.previewLabel}</span>
+          <strong>{previewStateLabel}</strong>
         </div>
-
-        <div className="header-side">
-          <section className="locale-card" aria-label={copy.localeLabel}>
-            <span className="locale-label">{copy.localeLabel}</span>
-            <div className="locale-toggle">
-              <button
-                className={locale === "en" ? "toggle-active" : undefined}
-                type="button"
-                onClick={() => setLocale("en")}
-              >
-                {copy.localeOptions.en}
-              </button>
-              <button
-                className={locale === "zh" ? "toggle-active" : undefined}
-                type="button"
-                onClick={() => setLocale("zh")}
-              >
-                {copy.localeOptions.zh}
-              </button>
-            </div>
-          </section>
-
-          <section className="hero-card" aria-label={copy.launch.title}>
-            <div className="hero-card-route">
-              <span className="hero-card-label">{copy.launch.routeLabel}</span>
-              <div className="route-visual" aria-label={routeLabel}>
-                <span className="route-visual-chip">{langInLabel}</span>
-                <span className="route-visual-arrow" aria-hidden="true">
-                  →
-                </span>
-                <span className="route-visual-chip">{langOutLabel}</span>
-              </div>
-            </div>
-
-            <div className="hero-facts">
-              <div className="hero-fact">
-                <span className="hero-fact-label">{copy.launch.engineLabel}</span>
-                <strong>{service}</strong>
-              </div>
-              <div className="hero-fact">
-                <span className="hero-fact-label">{copy.launch.pagesLabel}</span>
-                <strong>{pageScopeLabel}</strong>
-              </div>
-              <div className="hero-fact">
-                <span className="hero-fact-label">{copy.launch.outputLabel}</span>
-                <strong>{outputModeLabel}</strong>
-              </div>
-              <div className="hero-fact">
-                <span className="hero-fact-label">{copy.source.transportLabel}</span>
-                <strong>{sourceTransportLabel}</strong>
-              </div>
-            </div>
-          </section>
+        <div className="meta-item">
+          <span className="meta-label">{copy.source.transportLabel}</span>
+          <strong>{sourceTransportLabel}</strong>
         </div>
-      </header>
+        <div className="meta-item">
+          <span className="meta-label">{copy.source.safetyLabel}</span>
+          <strong>{copy.source.safetyValue}</strong>
+        </div>
+      </div>
+    </section>
+  );
 
-      <section className="top-grid">
-        <div className="top-grid-main">
-          <section className="panel-card source-card">
-            <div className="section-heading">
-              <p className="section-eyebrow">{copy.source.eyebrow}</p>
-              <h2>{copy.source.title}</h2>
-              <p className="section-copy">{copy.source.body}</p>
-            </div>
+  const routePanel = (
+    <section className="panel-card route-card workspace-panel">
+      <div className="section-heading">
+        <p className="section-eyebrow">{copy.route.eyebrow}</p>
+        <h2>{copy.route.title}</h2>
+        <p className="section-copy">{copy.route.body}</p>
+      </div>
 
-            <div className="mode-toggle">
-              <button
-                className={sourceMode === "upload" ? "mode-active" : undefined}
-                type="button"
-                onClick={() => setSourceMode("upload")}
-              >
-                {copy.source.uploadMode}
-              </button>
-              <button
-                className={sourceMode === "link" ? "mode-active" : undefined}
-                type="button"
-                onClick={() => setSourceMode("link")}
-              >
-                {copy.source.linkMode}
-              </button>
-            </div>
+      <div className="route-language-grid">
+        <label className="field">
+          <span className="field-label">{copy.route.sourceLanguage}</span>
+          <select
+            className="field-input"
+            value={langIn}
+            onChange={(event) => setLangIn(event.target.value)}
+          >
+            {languageOptions.map((option) => (
+              <option key={`from-${option.value}`} value={option.value}>
+                {option.label}
+              </option>
+            ))}
+          </select>
+        </label>
 
-            {sourceMode === "upload" ? (
-              <label className="upload-dropzone">
-                <span className="upload-title">
-                  {sourceFile?.name ?? copy.source.uploadEmptyTitle}
-                </span>
-                <span className="upload-copy">
-                  {sourceFile
-                    ? `${copy.source.uploadSelectedPrefix}${selectedFileSize ? `, ${selectedFileSize}` : ""}.`
-                    : copy.source.uploadEmptyBody}
-                </span>
-                <span className="upload-cta">{copy.source.uploadMode}</span>
-                <input
-                  accept="application/pdf,.pdf"
-                  type="file"
-                  onChange={(event) => {
-                    setSourceFile(event.target.files?.[0] ?? null);
-                    setStatusKey("intro");
-                  }}
-                />
-              </label>
-            ) : (
-              <label className="field">
-                <span className="field-label">{copy.source.directUrlLabel}</span>
-                <input
-                  className="field-input"
-                  placeholder={copy.source.directUrlPlaceholder}
-                  type="url"
-                  value={fileUrl}
-                  onChange={(event) => {
-                    setFileUrl(event.target.value);
-                    setStatusKey("intro");
-                  }}
-                />
-                <p className="field-hint">{copy.source.directUrlHint}</p>
-              </label>
-            )}
+        <button
+          className="route-swap-button"
+          type="button"
+          onClick={handleSwapLanguages}
+        >
+          <span aria-hidden="true">⇄</span>
+          <span>{copy.route.swapLanguages}</span>
+        </button>
 
-            <div className="meta-grid">
-              <div className="meta-item">
-                <span className="meta-label">{copy.source.previewLabel}</span>
-                <strong>
-                  {previewTarget
-                    ? copy.source.previewReady
-                    : copy.source.previewWaiting}
-                </strong>
-              </div>
-              <div className="meta-item">
-                <span className="meta-label">{copy.source.transportLabel}</span>
-                <strong>{sourceTransportLabel}</strong>
-              </div>
-              <div className="meta-item">
-                <span className="meta-label">{copy.source.safetyLabel}</span>
-                <strong>{copy.source.safetyValue}</strong>
-              </div>
-            </div>
-          </section>
+        <label className="field">
+          <span className="field-label">{copy.route.targetLanguage}</span>
+          <select
+            className="field-input"
+            value={langOut}
+            onChange={(event) => setLangOut(event.target.value)}
+          >
+            {languageOptions.map((option) => (
+              <option key={`to-${option.value}`} value={option.value}>
+                {option.label}
+              </option>
+            ))}
+          </select>
+        </label>
+      </div>
 
-          <section className="panel-card route-card">
-            <div className="section-heading">
-              <p className="section-eyebrow">{copy.route.eyebrow}</p>
-              <h2>{copy.route.title}</h2>
-              <p className="section-copy">{copy.route.body}</p>
-            </div>
+      <div className="route-service-grid">
+        <label className="field route-service-field">
+          <span className="field-label">{copy.route.service}</span>
+          <select
+            className="field-input"
+            value={service}
+            onChange={(event) => handleServiceChange(event.target.value)}
+          >
+            {appConfig.services.map((item) => (
+              <option key={item.name} value={item.name}>
+                {item.name}
+              </option>
+            ))}
+          </select>
+        </label>
 
-            <div className="route-language-grid">
-              <label className="field">
-                <span className="field-label">{copy.route.sourceLanguage}</span>
-                <select
-                  className="field-input"
-                  value={langIn}
-                  onChange={(event) => setLangIn(event.target.value)}
-                >
-                  {languageOptions.map((option) => (
-                    <option key={`from-${option.value}`} value={option.value}>
-                      {option.label}
-                    </option>
-                  ))}
-                </select>
-              </label>
+        <div className="service-banner">
+          <span className="service-banner-title">
+            {service === "SiliconFlowFree"
+              ? copy.route.freeEngineTitle
+              : copy.route.privateEngineTitle}
+          </span>
+          <p>
+            {service === "SiliconFlowFree"
+              ? copy.route.freeEngineBody
+              : copy.route.privateEngineBody}
+          </p>
+        </div>
+      </div>
+    </section>
+  );
 
-              <button
-                className="route-swap-button"
-                type="button"
-                onClick={handleSwapLanguages}
-              >
-                <span aria-hidden="true">⇄</span>
-                <span>{copy.route.swapLanguages}</span>
-              </button>
+  const settingsPanel = (
+    <section className="panel-card settings-board workspace-panel">
+      <div className="section-heading">
+        <p className="section-eyebrow">{copy.settings.eyebrow}</p>
+        <h2>{copy.settings.titles[activeTab]}</h2>
+        <p className="section-copy">{copy.settings.descriptions[activeTab]}</p>
+      </div>
 
-              <label className="field">
-                <span className="field-label">{copy.route.targetLanguage}</span>
-                <select
-                  className="field-input"
-                  value={langOut}
-                  onChange={(event) => setLangOut(event.target.value)}
-                >
-                  {languageOptions.map((option) => (
-                    <option key={`to-${option.value}`} value={option.value}>
-                      {option.label}
-                    </option>
-                  ))}
-                </select>
-              </label>
-            </div>
+      <div className="settings-tabs">
+        {(["engine", "translation", "pdf"] as const).map((tab) => (
+          <button
+            key={tab}
+            className={activeTab === tab ? "tab-active" : undefined}
+            type="button"
+            onClick={() => setActiveTab(tab)}
+          >
+            {copy.settings.tabs[tab]}
+          </button>
+        ))}
+      </div>
 
-            <div className="route-service-grid">
-              <label className="field route-service-field">
-                <span className="field-label">{copy.route.service}</span>
-                <select
-                  className="field-input"
-                  value={service}
-                  onChange={(event) => handleServiceChange(event.target.value)}
-                >
-                  {appConfig.services.map((item) => (
-                    <option key={item.name} value={item.name}>
-                      {item.name}
-                    </option>
-                  ))}
-                </select>
-              </label>
+      <SettingsSection
+        title={copy.settings.titles[activeTab]}
+        eyebrow={copy.settings.tabs[activeTab]}
+        description={copy.settings.descriptions[activeTab]}
+        emptyMessage={
+          noEngineFields
+            ? locale === "zh"
+              ? "当前引擎没有额外的前端配置项。"
+              : "This engine does not expose extra frontend settings."
+            : undefined
+        }
+        locale={locale}
+        fieldLabels={{
+          leaveBlank: copy.field.leaveBlankSecret,
+          required: copy.field.required,
+          optional: copy.field.optional,
+          useDefault: copy.field.useDefault,
+        }}
+        fields={activeTabFields}
+        values={
+          activeTab === "engine"
+            ? engineValues
+            : activeTab === "translation"
+              ? translationValues
+              : pdfValues
+        }
+        onChange={(name, value) => {
+          if (activeTab === "engine") {
+            updateFieldValues(setEngineValues, name, value);
+            return;
+          }
+          if (activeTab === "translation") {
+            updateFieldValues(setTranslationValues, name, value);
+            return;
+          }
+          updateFieldValues(setPdfValues, name, value);
+        }}
+      />
+    </section>
+  );
 
-              <div className="service-banner">
-                <span className="service-banner-title">
-                  {service === "SiliconFlowFree"
-                    ? copy.route.freeEngineTitle
-                    : copy.route.privateEngineTitle}
-                </span>
+  const previewPanel = (
+    <PreviewPanel
+      eyebrow={copy.preview.eyebrow}
+      previewUrl={previewTarget}
+      title={result ? copy.preview.translatedTitle : copy.preview.sourceTitle}
+      caption={result ? copy.preview.translatedBody : copy.preview.sourceBody}
+      emptyTitle={copy.preview.emptyTitle}
+      emptyCaption={copy.preview.emptyBody}
+    />
+  );
+
+  const downloadsPanel = (
+    <DownloadGrid
+      result={result}
+      eyebrow={copy.downloads.eyebrow}
+      title={copy.downloads.title}
+      description={copy.downloads.body}
+      emptyText={copy.downloads.empty}
+      readyText={copy.downloads.ready}
+      artifactLabel={(name) => artifactLabel(name, locale)}
+    />
+  );
+
+  const overviewPanel = (
+    <section className="panel-card overview-panel">
+      <div className="overview-copy">
+        <p className="section-eyebrow">{workspaceCopy.nav.overview}</p>
+        <h2>{currentWorkspaceState}</h2>
+        <p className="section-copy">{currentMessage}</p>
+      </div>
+
+      <div className="overview-route-shell">
+        <span className="hero-card-label">{copy.launch.routeLabel}</span>
+        {renderRouteVisual()}
+      </div>
+
+      <div className="overview-summary-grid">
+        <div className="summary-pill">
+          <span className="summary-label">{copy.launch.sourceLabel}</span>
+          <strong>{sourceLabel}</strong>
+        </div>
+        <div className="summary-pill">
+          <span className="summary-label">{copy.launch.engineLabel}</span>
+          <strong>{service}</strong>
+        </div>
+        <div className="summary-pill">
+          <span className="summary-label">{copy.launch.pagesLabel}</span>
+          <strong>{pageScopeLabel}</strong>
+        </div>
+        <div className="summary-pill">
+          <span className="summary-label">{copy.launch.outputLabel}</span>
+          <strong>{outputModeLabel}</strong>
+        </div>
+      </div>
+    </section>
+  );
+
+  const controlPanel = (
+    <section className={`panel-card launch-card control-panel status-${currentStatusTone}`}>
+      <div className="section-heading">
+        <p className="section-eyebrow">{workspaceCopy.runTitle}</p>
+        <h3>{currentWorkspaceState}</h3>
+        <p className="section-copy">{currentMessage}</p>
+      </div>
+
+      <div className="status-header">
+        <div className="status-copy">
+          <p className="status-stage">{currentStage}</p>
+          <p>{copy.launch.backendStageLabel}</p>
+        </div>
+        <span className="status-pill">{progressPercentLabel}</span>
+      </div>
+
+      <div className="status-meter">
+        <div
+          className="status-meter-fill"
+          style={{ transform: `scaleX(${Math.max(progress, 0.04)})` }}
+        />
+      </div>
+
+      <div className="launch-focus">
+        <span className="summary-label">{copy.launch.sourceLabel}</span>
+        <strong>{sourceLabel}</strong>
+        <p>
+          {copy.launch.routeLabel}: {routeLabel}
+        </p>
+      </div>
+
+      <div className="meta-grid control-meta-grid">
+        <div className="meta-item">
+          <span className="meta-label">{copy.launch.engineLabel}</span>
+          <strong>{service}</strong>
+        </div>
+        <div className="meta-item">
+          <span className="meta-label">{copy.launch.pagesLabel}</span>
+          <strong>{pageScopeLabel}</strong>
+        </div>
+        <div className="meta-item">
+          <span className="meta-label">{copy.launch.outputLabel}</span>
+          <strong>{outputModeLabel}</strong>
+        </div>
+        <div className="meta-item">
+          <span className="meta-label">{workspaceCopy.previewStateLabel}</span>
+          <strong>{previewStateLabel}</strong>
+        </div>
+        <div className="meta-item">
+          <span className="meta-label">{workspaceCopy.filesLabel}</span>
+          <strong>{downloadCount}</strong>
+        </div>
+        <div className="meta-item">
+          <span className="meta-label">{copy.launch.routeLabel}</span>
+          <strong>{routeCompactLabel}</strong>
+        </div>
+      </div>
+
+      {missingSecretLabels.length > 0 && service !== "SiliconFlowFree" ? (
+        <div className="notice-card">
+          <p className="notice-title">{copy.launch.missingCredentialsTitle}</p>
+          <p>{missingSecretLabels.join(", ")}</p>
+        </div>
+      ) : null}
+
+      <div className="action-row">
+        <button
+          className="primary-button"
+          disabled={isRunning}
+          type="button"
+          onClick={() => void handleTranslate()}
+        >
+          {isRunning ? copy.launch.running : copy.launch.start}
+        </button>
+        <button
+          className="secondary-button"
+          disabled={!isRunning}
+          type="button"
+          onClick={handleCancel}
+        >
+          {copy.launch.cancel}
+        </button>
+      </div>
+
+      {currentErrorTitle ? (
+        <div className="status-callout">
+          <strong>{currentErrorTitle}</strong>
+        </div>
+      ) : null}
+
+      {technicalState ? (
+        <details className="technical-details">
+          <summary>{copy.launch.technicalDetails}</summary>
+          <pre>{technicalState}</pre>
+        </details>
+      ) : null}
+
+      {result?.token_usage ? (
+        <div className="token-card">
+          <p className="token-title">{copy.progress.tokenUsageTitle}</p>
+          <div className="token-grid">
+            {Object.entries(result.token_usage).map(([scope, usage]) => (
+              <div key={scope} className="token-item">
+                <p className="token-scope">{scope}</p>
                 <p>
-                  {service === "SiliconFlowFree"
-                    ? copy.route.freeEngineBody
-                    : copy.route.privateEngineBody}
+                  {usage.total ?? 0} {copy.progress.tokenTotalSuffix}
                 </p>
               </div>
-            </div>
+            ))}
+          </div>
+        </div>
+      ) : null}
+    </section>
+  );
 
-            <div className="route-summary-card">
-              <span className="hero-card-label">{copy.launch.routeLabel}</span>
-              <div className="route-visual route-visual-panel" aria-label={routeLabel}>
-                <span className="route-visual-chip">{langInLabel}</span>
-                <span className="route-visual-arrow" aria-hidden="true">
-                  →
-                </span>
-                <span className="route-visual-chip">{langOutLabel}</span>
-              </div>
-            </div>
-          </section>
+  const resultsPanel = (
+    <div className="results-layout">
+      <div className="results-preview-column">{previewPanel}</div>
+      <div className="results-side-column">{downloadsPanel}</div>
+    </div>
+  );
+
+  let primaryContent: ReactElement;
+
+  switch (activeSection) {
+    case "source":
+      primaryContent = sourcePanel;
+      break;
+    case "route":
+      primaryContent = routePanel;
+      break;
+    case "settings":
+      primaryContent = settingsPanel;
+      break;
+    case "results":
+      primaryContent = resultsPanel;
+      break;
+    case "overview":
+    default:
+      primaryContent = overviewPanel;
+      break;
+  }
+
+  return (
+    <div className="app-shell app-workbench">
+      <aside className="app-sidebar">
+        <div className="sidebar-brand">
+          <div className="sidebar-brand-mark">PF</div>
+          <div className="sidebar-brand-copy">
+            <strong>{copy.appName}</strong>
+            <span>{currentWorkspaceState}</span>
+          </div>
         </div>
 
-        <section className="panel-card launch-card">
-          <div className="section-heading">
-            <p className="section-eyebrow">{copy.launch.eyebrow}</p>
-            <h2>{copy.launch.title}</h2>
-            <p className="section-copy">{copy.launch.body}</p>
-          </div>
-
-          <div className="launch-summary">
-            <div className="summary-item">
-              <span className="summary-label">{copy.launch.stateLabel}</span>
-              <strong>{currentWorkspaceState}</strong>
-            </div>
-            <div className="summary-item">
-              <span className="summary-label">{copy.launch.sourceLabel}</span>
-              <strong>{sourceLabel}</strong>
-            </div>
-            <div className="summary-item">
-              <span className="summary-label">{copy.launch.routeLabel}</span>
-              <strong>{routeLabel}</strong>
-            </div>
-            <div className="summary-item">
-              <span className="summary-label">{copy.launch.engineLabel}</span>
-              <strong>{service}</strong>
-            </div>
-            <div className="summary-item">
-              <span className="summary-label">{copy.launch.pagesLabel}</span>
-              <strong>{pageScopeLabel}</strong>
-            </div>
-            <div className="summary-item">
-              <span className="summary-label">{copy.launch.outputLabel}</span>
-              <strong>{outputModeLabel}</strong>
-            </div>
-          </div>
-
-          {missingSecretLabels.length > 0 && service !== "SiliconFlowFree" ? (
-            <div className="notice-card">
-              <p className="notice-title">{copy.launch.missingCredentialsTitle}</p>
-              <p>{missingSecretLabels.join(", ")}</p>
-            </div>
-          ) : null}
-
-          <div className="action-row">
+        <nav className="sidebar-nav" aria-label={workspaceCopy.nav.overview}>
+          {workspaceSections.map((section) => (
             <button
-              className="primary-button"
-              disabled={isRunning}
+              key={section.id}
+              className={`sidebar-nav-item${activeSection === section.id ? " sidebar-nav-item-active" : ""}`}
               type="button"
-              onClick={() => void handleTranslate()}
+              onClick={() => setActiveSection(section.id)}
             >
-              {isRunning ? copy.launch.running : copy.launch.start}
+              <span className="sidebar-nav-key">{section.key}</span>
+              <span className="sidebar-nav-copy">
+                <strong>{section.label}</strong>
+                <span>{section.detail}</span>
+              </span>
+              {section.badge ? (
+                <span className="sidebar-nav-badge">{section.badge}</span>
+              ) : null}
             </button>
-            <button
-              className="secondary-button"
-              disabled={!isRunning}
-              type="button"
-              onClick={handleCancel}
-            >
-              {copy.launch.cancel}
-            </button>
+          ))}
+        </nav>
+
+        <div className="sidebar-footer">
+          <span className="section-eyebrow">{workspaceCopy.contextTitle}</span>
+          <strong>{routeLabel}</strong>
+          <p>{service}</p>
+        </div>
+      </aside>
+
+      <main className="app-workspace">
+        <header className="workspace-header">
+          <div className="workspace-header-copy">
+            <p className="section-eyebrow">{copy.appName}</p>
+            <h1>{activeSectionMeta.title}</h1>
+            <p className="header-body">{activeSectionMeta.description}</p>
           </div>
-        </section>
-      </section>
 
-      <div className="workspace-grid">
-        <div className="workspace-main">
-          <section className="panel-card settings-board">
-            <div className="section-heading">
-              <p className="section-eyebrow">{copy.settings.eyebrow}</p>
-              <h2>{copy.settings.titles[activeTab]}</h2>
-              <p className="section-copy">{copy.settings.descriptions[activeTab]}</p>
-            </div>
-
-            <div className="settings-tabs">
-              {(["engine", "translation", "pdf"] as const).map((tab) => (
+          <div className="workspace-header-side">
+            <section className="locale-card" aria-label={copy.localeLabel}>
+              <span className="locale-label">{copy.localeLabel}</span>
+              <div className="locale-toggle">
                 <button
-                  key={tab}
-                  className={activeTab === tab ? "tab-active" : undefined}
+                  className={locale === "en" ? "toggle-active" : undefined}
                   type="button"
-                  onClick={() => setActiveTab(tab)}
+                  onClick={() => setLocale("en")}
                 >
-                  {copy.settings.tabs[tab]}
+                  {copy.localeOptions.en}
                 </button>
-              ))}
-            </div>
-
-            <SettingsSection
-              title={copy.settings.titles[activeTab]}
-              eyebrow={copy.settings.tabs[activeTab]}
-              description={copy.settings.descriptions[activeTab]}
-              emptyMessage={
-                noEngineFields
-                  ? locale === "zh"
-                    ? "当前引擎没有额外的前端配置项。"
-                    : "This engine does not expose extra frontend settings."
-                  : undefined
-              }
-              locale={locale}
-              fieldLabels={{
-                leaveBlank: copy.field.leaveBlankSecret,
-                required: copy.field.required,
-                optional: copy.field.optional,
-                useDefault: copy.field.useDefault,
-              }}
-              fields={activeTabFields}
-              values={
-                activeTab === "engine"
-                  ? engineValues
-                  : activeTab === "translation"
-                    ? translationValues
-                    : pdfValues
-              }
-              onChange={(name, value) => {
-                if (activeTab === "engine") {
-                  updateFieldValues(setEngineValues, name, value);
-                  return;
-                }
-                if (activeTab === "translation") {
-                  updateFieldValues(setTranslationValues, name, value);
-                  return;
-                }
-                updateFieldValues(setPdfValues, name, value);
-              }}
-            />
-          </section>
-          <div className="workspace-support-grid">
-            <ProgressPanel
-              eyebrow={copy.progress.eyebrow}
-              title={copy.progress.titles[currentStatusTone]}
-              stage={currentStage}
-              message={currentMessage}
-              progress={progress}
-              progressLabel={`${Math.max(0, Math.min(100, Math.round(progress * 100)))}%`}
-              statusTone={currentStatusTone}
-              result={result}
-              errorTitle={
-                statusKey === "failed" || statusKey === "config_unavailable"
-                  ? copy.progress.errorTitles[
-                      (errorCode as keyof typeof copy.progress.errorTitles) ?? "default"
-                    ] ?? copy.progress.errorTitles.default
-                  : null
-              }
-              technicalDetailsLabel={copy.launch.technicalDetails}
-              technicalDetails={technicalState}
-              meta={[
-                { label: copy.progress.meta.engine, value: service },
-                { label: copy.progress.meta.route, value: routeLabel },
-                { label: copy.progress.meta.pages, value: pageScopeLabel },
-                { label: copy.progress.meta.output, value: outputModeLabel },
-              ]}
-              tokenUsageTitle={copy.progress.tokenUsageTitle}
-              tokenTotalSuffix={copy.progress.tokenTotalSuffix}
-            />
-
-            <DownloadGrid
-              result={result}
-              eyebrow={copy.downloads.eyebrow}
-              title={copy.downloads.title}
-              description={copy.downloads.body}
-              emptyText={copy.downloads.empty}
-              readyText={copy.downloads.ready}
-              artifactLabel={(name) => artifactLabel(name, locale)}
-            />
+                <button
+                  className={locale === "zh" ? "toggle-active" : undefined}
+                  type="button"
+                  onClick={() => setLocale("zh")}
+                >
+                  {copy.localeOptions.zh}
+                </button>
+              </div>
+            </section>
           </div>
-        </div>
+        </header>
 
-        <aside className="workspace-side workspace-preview-column">
-          <PreviewPanel
-            eyebrow={copy.preview.eyebrow}
-            previewUrl={previewTarget}
-            title={result ? copy.preview.translatedTitle : copy.preview.sourceTitle}
-            caption={result ? copy.preview.translatedBody : copy.preview.sourceBody}
-            emptyTitle={copy.preview.emptyTitle}
-            emptyCaption={copy.preview.emptyBody}
-          />
-        </aside>
-      </div>
+        <div
+          className={`workspace-content${activeSection === "results" ? " workspace-content-results" : ""}`}
+        >
+          <section className="workspace-primary">{primaryContent}</section>
+          <aside className="workspace-secondary">
+            <div className="utility-rail">{controlPanel}</div>
+          </aside>
+        </div>
+      </main>
     </div>
   );
 }
