@@ -145,20 +145,4 @@ If you don't know what code to use to translate to the language you need, check 
 
 We welcome the active participation of contributors to make pdf2zh better. Before you are ready to submit your code, please refer to our [Code of Conduct](https://pdf2zh-next.com/community/CODE_OF_CONDUCT.html) and [Contribution Guide](https://pdf2zh-next.com/community/Contribution-Guide.html).
 
-<h2 id="contrib">Contributors</h2>
 
-<!-- <a href="https://github.com/PDFMathTranslate-next/PDFMathTranslate-next/graphs/contributors">
-  <img src="https://opencollective.com/PDFMathTranslate/contributors.svg?width=890&button=false" />
-</a> -->
-
-<!-- ![Alt](https://repobeats.axiom.co/api/embed/45529651750579e099960950f757449a410477ad.svg "Repobeats analytics image") -->
-
-<h2 id="star_hist">Star History</h2>
-
-<a href="https://star-history.com/#PDFMathTranslate-next/PDFMathTranslate-next&Date">
- <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=PDFMathTranslate-next/PDFMathTranslate-next&type=Date&theme=dark" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=PDFMathTranslate-next/PDFMathTranslate-next&type=Date" />
-   <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=PDFMathTranslate-next/PDFMathTranslate-next&type=Date"/>
- </picture>
-</a>
