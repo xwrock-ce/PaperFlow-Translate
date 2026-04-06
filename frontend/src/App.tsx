@@ -1455,13 +1455,15 @@ export default function App(): ReactElement {
                 onClick={() => setActiveSection(section.id)}
               >
                 <span className="sidebar-nav-key">{section.key}</span>
-                <span className="sidebar-nav-copy">
-                  <strong>{section.label}</strong>
-                  <span>{section.detail}</span>
+                <span className="sidebar-nav-main">
+                  <span className="sidebar-nav-heading">
+                    <strong>{section.label}</strong>
+                    {section.badge ? (
+                      <span className="sidebar-nav-badge">{section.badge}</span>
+                    ) : null}
+                  </span>
+                  <span className="sidebar-nav-detail">{section.detail}</span>
                 </span>
-                {section.badge ? (
-                  <span className="sidebar-nav-badge">{section.badge}</span>
-                ) : null}
               </button>
             ))}
           </nav>
@@ -1475,7 +1477,10 @@ export default function App(): ReactElement {
 
         <main className="app-workspace">
           <header className="workspace-topbar">
-            <div className="workspace-context-bar" aria-label={workspaceCopy.contextTitle}>
+            <div
+              className="workspace-context-bar"
+              aria-label={workspaceCopy.contextTitle}
+            >
               {workspaceContextItems.map((item) => (
                 <div
                   key={item.label}
@@ -1487,7 +1492,10 @@ export default function App(): ReactElement {
               ))}
             </div>
 
-            <section className="locale-card locale-card-compact" aria-label={copy.localeLabel}>
+            <section
+              className="locale-card locale-card-compact"
+              aria-label={copy.localeLabel}
+            >
               <span className="locale-label">{copy.localeLabel}</span>
               <div className="locale-toggle">
                 <button
