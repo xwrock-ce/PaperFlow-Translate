@@ -138,6 +138,38 @@ def test_translation_language_labels_fall_back_when_langcodes_returns_blank(
     assert english["label"]["zh"] == "English"
 
 
+def test_translation_language_labels_use_builtin_zh_fallback_when_unlocalized(
+    monkeypatch,
+):
+    from pdf2zh_next import web_localization
+
+    original_get = web_localization.langcodes.Language.get
+
+    class _EchoLanguage:
+        def display_name(self, _locale: str) -> str:
+            return "English"
+
+    def _fake_get(code: str):
+        if code == "en":
+            return _EchoLanguage()
+        return original_get(code)
+
+    monkeypatch.setattr(
+        web_localization.langcodes.Language,
+        "get",
+        staticmethod(_fake_get),
+    )
+
+    english = next(
+        item
+        for item in web_localization.build_translation_language_options()
+        if item["value"] == "en"
+    )
+
+    assert english["label"]["en"] == "English"
+    assert english["label"]["zh"] == "英语"
+
+
 def test_ui_config_scrubs_sensitive_values(monkeypatch):
     monkeypatch.setattr(
         "pdf2zh_next.http_api._load_base_cli_settings",

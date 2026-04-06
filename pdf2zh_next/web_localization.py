@@ -18,6 +18,11 @@ _LANGUAGE_ZH_OVERRIDES = {
     "pt-BR": "巴西葡萄牙语",
 }
 
+_LANGUAGE_ZH_FALLBACKS_WHEN_UNLOCALIZED = {
+    # `langcodes` returns "English" for zh labels when `language_data` is missing.
+    "en": "英语",
+}
+
 _GENERAL_FIELD_LABELS: dict[str, LocalizedText] = {
     "min_text_length": {"en": "Minimum Text Length", "zh": "最短翻译文本长度"},
     "rpc_doclayout": {"en": "Layout RPC Address", "zh": "版面分析 RPC 地址"},
@@ -202,7 +207,13 @@ def _localized_language_name(english_label: str, code: str) -> LocalizedText:
         try:
             zh_label = langcodes.Language.get(code).display_name("zh")
         except Exception:
-            zh_label = ""
+            zh_label = _LANGUAGE_ZH_FALLBACKS_WHEN_UNLOCALIZED.get(code, "")
+        normalized_zh_label = (zh_label or "").strip()
+        if (
+            normalized_zh_label
+            and normalized_zh_label.casefold() == fallback_en.casefold()
+        ):
+            zh_label = _LANGUAGE_ZH_FALLBACKS_WHEN_UNLOCALIZED.get(code, zh_label)
     return localized(fallback_en, _normalized_label_text(zh_label, fallback_en))
 
 

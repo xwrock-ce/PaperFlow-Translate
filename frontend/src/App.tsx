@@ -905,8 +905,6 @@ export default function App(): ReactElement {
     id: WorkspaceSection;
     key: string;
     label: string;
-    title: string;
-    description: string;
     detail: string;
     badge: string | null;
   }> = [
@@ -914,8 +912,6 @@ export default function App(): ReactElement {
       id: "overview",
       key: "01",
       label: workspaceCopy.nav.overview,
-      title: workspaceCopy.titles.overview,
-      description: workspaceCopy.descriptions.overview,
       detail: currentWorkspaceState,
       badge: currentStatusTone === "active" ? progressPercentLabel : null,
     },
@@ -923,8 +919,6 @@ export default function App(): ReactElement {
       id: "source",
       key: "02",
       label: workspaceCopy.nav.source,
-      title: workspaceCopy.titles.source,
-      description: workspaceCopy.descriptions.source,
       detail: sourceTransportLabel,
       badge: sourceReady ? copy.source.previewReady : null,
     },
@@ -932,8 +926,6 @@ export default function App(): ReactElement {
       id: "route",
       key: "03",
       label: workspaceCopy.nav.route,
-      title: workspaceCopy.titles.route,
-      description: workspaceCopy.descriptions.route,
       detail: routeCompactLabel,
       badge: null,
     },
@@ -941,8 +933,6 @@ export default function App(): ReactElement {
       id: "settings",
       key: "04",
       label: workspaceCopy.nav.settings,
-      title: workspaceCopy.titles.settings,
-      description: workspaceCopy.descriptions.settings,
       detail: copy.settings.tabs[activeTab],
       badge: activeService?.fields.length ? String(activeService.fields.length) : null,
     },
@@ -950,18 +940,45 @@ export default function App(): ReactElement {
       id: "results",
       key: "05",
       label: workspaceCopy.nav.results,
-      title: workspaceCopy.titles.results,
-      description: workspaceCopy.descriptions.results,
       detail: downloadCount
         ? `${downloadCount} ${workspaceCopy.filesLabel}`
         : previewStateLabel,
       badge: downloadCount ? String(downloadCount) : null,
     },
   ];
-  const activeSectionMeta =
-    workspaceSections.find((section) => section.id === activeSection) ??
-    workspaceSections[0];
-  const headerHighlights = [
+  const mobileSections = workspaceSections.map((section) => ({
+    ...section,
+    mobileLabel:
+      section.id === "overview"
+        ? locale === "zh"
+          ? "总览"
+          : "Overview"
+        : section.id === "source"
+          ? locale === "zh"
+            ? "来源"
+            : "Source"
+          : section.id === "route"
+            ? locale === "zh"
+              ? "路线"
+              : "Route"
+            : section.id === "settings"
+              ? locale === "zh"
+                ? "参数"
+                : "Settings"
+              : locale === "zh"
+                ? "结果"
+                : "Results",
+  }));
+  const workspaceContextItems = [
+    {
+      label: copy.launch.stateLabel,
+      value: currentWorkspaceState,
+      tone: currentStatusTone,
+    },
+    {
+      label: copy.launch.sourceLabel,
+      value: sourceReady ? sourceLabel : sourceTransportLabel,
+    },
     {
       label: copy.launch.routeLabel,
       value: routeCompactLabel,
@@ -971,8 +988,12 @@ export default function App(): ReactElement {
       value: service,
     },
     {
-      label: copy.launch.sourceLabel,
-      value: sourceReady ? sourceLabel : sourceTransportLabel,
+      label: copy.launch.pagesLabel,
+      value: pageScopeLabel,
+    },
+    {
+      label: copy.launch.outputLabel,
+      value: outputModeLabel,
     },
   ];
 
@@ -1453,59 +1474,75 @@ export default function App(): ReactElement {
         </aside>
 
         <main className="app-workspace">
-          <header className="workspace-header">
-            <div className="workspace-header-copy">
-              <p className="section-eyebrow">{copy.appName}</p>
-              <h1>{activeSectionMeta.title}</h1>
-              <p className="header-body">{activeSectionMeta.description}</p>
-
-              <div className="workspace-header-highlights">
-                {headerHighlights.map((item) => (
-                  <div key={item.label} className="workspace-highlight">
-                    <span className="meta-label">{item.label}</span>
-                    <strong>{item.value}</strong>
-                  </div>
-                ))}
-              </div>
-            </div>
-
-            <div className="workspace-header-side">
-              <span className={`workspace-status-chip workspace-status-chip-${currentStatusTone}`}>
-                {currentWorkspaceState}
-              </span>
-
-              <section className="locale-card" aria-label={copy.localeLabel}>
-                <span className="locale-label">{copy.localeLabel}</span>
-                <div className="locale-toggle">
-                  <button
-                    className={locale === "en" ? "toggle-active" : undefined}
-                    type="button"
-                    onClick={() => setLocale("en")}
-                  >
-                    {copy.localeOptions.en}
-                  </button>
-                  <button
-                    className={locale === "zh" ? "toggle-active" : undefined}
-                    type="button"
-                    onClick={() => setLocale("zh")}
-                  >
-                    {copy.localeOptions.zh}
-                  </button>
+          <header className="workspace-topbar">
+            <div className="workspace-context-bar" aria-label={workspaceCopy.contextTitle}>
+              {workspaceContextItems.map((item) => (
+                <div
+                  key={item.label}
+                  className={`workspace-context-chip${item.tone ? ` workspace-context-chip-${item.tone}` : ""}`}
+                >
+                  <span className="workspace-context-label">{item.label}</span>
+                  <strong>{item.value}</strong>
                 </div>
-              </section>
+              ))}
             </div>
+
+            <section className="locale-card locale-card-compact" aria-label={copy.localeLabel}>
+              <span className="locale-label">{copy.localeLabel}</span>
+              <div className="locale-toggle">
+                <button
+                  className={locale === "en" ? "toggle-active" : undefined}
+                  type="button"
+                  onClick={() => setLocale("en")}
+                >
+                  {copy.localeOptions.en}
+                </button>
+                <button
+                  className={locale === "zh" ? "toggle-active" : undefined}
+                  type="button"
+                  onClick={() => setLocale("zh")}
+                >
+                  {copy.localeOptions.zh}
+                </button>
+              </div>
+            </section>
           </header>
 
           <div
             className={`workspace-content${activeSection === "results" ? " workspace-content-results" : ""}`}
           >
-            <section className="workspace-primary">{primaryContent}</section>
+            <section className="workspace-primary">
+              <div className={`workspace-paper workspace-paper-${activeSection}`}>
+                {primaryContent}
+              </div>
+            </section>
             <aside className="workspace-secondary">
               <div className="utility-rail">{controlPanel}</div>
             </aside>
           </div>
         </main>
       </div>
+
+      <nav className="mobile-tabbar" aria-label={workspaceCopy.nav.overview}>
+        <div className="mobile-tabbar-track">
+          {mobileSections.map((section) => (
+            <button
+              key={section.id}
+              className={`mobile-tabbar-item${activeSection === section.id ? " mobile-tabbar-item-active" : ""}`}
+              type="button"
+              onClick={() => setActiveSection(section.id)}
+            >
+              <span className="mobile-tabbar-icon">
+                {section.badge ?? section.key}
+              </span>
+              <span className="mobile-tabbar-copy">
+                <strong>{section.mobileLabel}</strong>
+                <span>{section.detail}</span>
+              </span>
+            </button>
+          ))}
+        </div>
+      </nav>
     </div>
   );
 }
