@@ -1,13 +1,24 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
+import time
+import warnings
+from contextlib import suppress
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import pytest
+import requests
 from fastapi.testclient import TestClient
+from pdf2zh_next import http_api as http_api_module
 from pdf2zh_next.config.cli_env_model import CLIEnvSettingsModel
+from pdf2zh_next.http_api import HTTPServerSettings
+from pdf2zh_next.http_api import _configure_runtime_noise_filters
 from pdf2zh_next.http_api import create_app
+from pdf2zh_next.translator.translator_impl.google import GoogleTranslator
 
 
 def _assert_localized_text(value: dict[str, str]) -> None:
@@ -15,8 +26,23 @@ def _assert_localized_text(value: dict[str, str]) -> None:
     assert value["zh"]
 
 
-def _client() -> TestClient:
-    return TestClient(create_app())
+def _client(
+    *,
+    server_settings: HTTPServerSettings | None = None,
+) -> TestClient:
+    class _ManagedTestClient(TestClient):
+        def __del__(self):
+            with suppress(Exception):
+                self.close()
+
+    if server_settings is None:
+        server_settings = HTTPServerSettings(
+            allow_local_input_file=True,
+            enable_file_url=True,
+        )
+    client = _ManagedTestClient(create_app(server_settings=server_settings))
+    client.__enter__()
+    return client
 
 
 def _make_pdf(tmp_path):
@@ -29,6 +55,18 @@ def _base_openai_settings() -> CLIEnvSettingsModel:
     return CLIEnvSettingsModel(
         openai=True,
         openai_detail={"openai_api_key": "test-key"},
+    )
+
+
+def _job_payload() -> str:
+    return json.dumps(
+        {
+            "settings": {
+                "openai": True,
+                "openai_detail": {"openai_api_key": "test-key"},
+            },
+            "source_type": "file",
+        }
     )
 
 
@@ -54,6 +92,16 @@ def _build_frontend_default_payload(app_config: dict, *, service_name: str) -> d
     }
 
 
+def test_create_app_lifespan_starts_and_stops_job_manager():
+    app = create_app()
+    assert app.state.job_manager._started is False
+
+    with TestClient(app):
+        assert app.state.job_manager._started is True
+
+    assert app.state.job_manager._started is False
+
+
 def test_healthz_returns_status_and_version():
     response = _client().get("/healthz")
 
@@ -62,6 +110,22 @@ def test_healthz_returns_status_and_version():
     assert payload["status"] == "ok"
     assert payload["version"]
     assert payload["default_config_file"].endswith(".toml")
+    assert payload["running_jobs"] == 0
+    assert payload["queued_jobs"] == 0
+    assert payload["job_retention_minutes"] == 30
+
+
+def test_translate_rejects_local_input_file_in_public_mode(tmp_path):
+    pdf_path = _make_pdf(tmp_path)
+    client = _client(server_settings=HTTPServerSettings())
+
+    response = client.post(
+        "/translate",
+        json={"input_file": str(pdf_path), "service": "OpenAI"},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "feature_disabled"
 
 
 def test_engines_lists_known_services():
@@ -168,6 +232,22 @@ def test_translation_language_labels_use_builtin_zh_fallback_when_unlocalized(
 
     assert english["label"]["en"] == "English"
     assert english["label"]["zh"] == "英语"
+
+
+def test_ui_bootstrap_disables_auto_term_extraction_for_non_llm_default_service(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        "pdf2zh_next.http_api._load_base_cli_settings",
+        lambda: CLIEnvSettingsModel(google=True),
+    )
+
+    response = _client().get("/ui/bootstrap")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["settings"]["service"] == "Google"
+    assert payload["settings"]["enable_auto_term_extraction"] is False
 
 
 def test_ui_config_scrubs_sensitive_values(monkeypatch):
@@ -424,13 +504,34 @@ def test_stream_translate_upload_returns_progress_and_finish(monkeypatch, tmp_pa
 
     assert response.status_code == 200
     lines = [json.loads(line) for line in response.text.splitlines() if line.strip()]
-    assert lines[0]["type"] == "progress"
-    assert lines[0]["stage"] == "Layout analysis"
-    assert lines[1]["type"] == "finish"
-    assert lines[1]["result"]["mono_download_url"].startswith("/requests/")
-    assert lines[1]["result"]["artifacts"]["mono"]["preview_url"].endswith(
+    status_line = next(line for line in lines if line["type"] == "status")
+    progress_line = next(line for line in lines if line["type"] == "progress")
+    finish_line = next(line for line in lines if line["type"] == "finish")
+    assert lines[0]["type"] == "status"
+    assert status_line["job"]["status"] in {"queued", "running"}
+    assert progress_line["stage"] == "Layout analysis"
+    assert finish_line["result"]["mono_download_url"].startswith("/requests/")
+    assert finish_line["result"]["artifacts"]["mono"]["preview_url"].endswith(
         "?disposition=inline"
     )
+
+
+def test_google_translator_uses_request_timeout_and_reraises_timeout(monkeypatch):
+    settings = CLIEnvSettingsModel(google=True).to_settings_model()
+    translator = GoogleTranslator(settings, Mock())
+    calls = []
+
+    def fake_get(*args, **kwargs):
+        calls.append(kwargs)
+        raise requests.Timeout("network timeout")
+
+    monkeypatch.setattr(translator.session, "get", fake_get)
+
+    with pytest.raises(requests.Timeout, match="network timeout"):
+        translator.do_translate("hello")
+
+    assert len(calls) == 3
+    assert all(call["timeout"] == 10 for call in calls)
 
 
 def test_stream_translate_accepts_frontend_default_blank_optionals(
@@ -496,6 +597,64 @@ def test_stream_translate_accepts_frontend_default_blank_optionals(
     assert lines[-1]["result"]["artifacts"]["mono"]["preview_url"].endswith(
         "?disposition=inline"
     )
+
+
+def test_stream_translate_non_llm_service_disables_auto_term_extraction_and_logs(
+    caplog,
+    monkeypatch,
+    tmp_path,
+):
+    mono_path = tmp_path / "paper-mono.pdf"
+    mono_path.write_bytes(b"%PDF-1.4\n")
+
+    monkeypatch.setattr(
+        "pdf2zh_next.http_api._load_base_cli_settings",
+        _base_openai_settings,
+    )
+
+    async def fake_translate_stream(settings, _file_path, *, raise_on_error=True):
+        assert raise_on_error is False
+        assert settings.basic.input_files == set()
+        assert settings.translate_engine_settings.translate_engine_type == "Google"
+        assert settings.translation.no_auto_extract_glossary is True
+        yield {
+            "type": "finish",
+            "translate_result": SimpleNamespace(
+                mono_pdf_path=mono_path,
+                dual_pdf_path=None,
+                auto_extracted_glossary_path=None,
+                total_seconds=1.0,
+            ),
+            "token_usage": {},
+        }
+
+    monkeypatch.setattr(
+        "pdf2zh_next.http_api.do_translate_async_stream",
+        fake_translate_stream,
+    )
+
+    with caplog.at_level(logging.INFO):
+        response = _client().post(
+            "/translate/file/stream",
+            data={
+                "request_json": json.dumps(
+                    {
+                        "service": "Google",
+                        "lang_in": "en",
+                        "lang_out": "zh",
+                        "translation": {},
+                        "pdf": {},
+                        "engine_settings": {},
+                    }
+                )
+            },
+            files={"file": ("paper.pdf", b"%PDF-1.4\n", "application/pdf")},
+        )
+
+    assert response.status_code == 200
+    assert "Automatic term extraction disabled for service=Google" in caplog.text
+    assert "Accepted translation job" in caplog.text
+    assert "service=Google auto_term_extraction=False" in caplog.text
 
 
 def test_download_artifact_serves_registered_output(monkeypatch, tmp_path):
@@ -589,3 +748,265 @@ def test_download_artifact_supports_inline_preview(monkeypatch, tmp_path):
     assert preview_response.content == b"%PDF-1.4\n"
     assert "inline" in preview_response.headers["content-disposition"]
     assert preview_response.headers["content-type"].startswith("application/pdf")
+
+
+def test_jobs_endpoint_returns_status_and_result(monkeypatch, tmp_path):
+    mono_path = tmp_path / "paper-mono.pdf"
+    mono_path.write_bytes(b"%PDF-1.4\n")
+
+    monkeypatch.setattr(
+        "pdf2zh_next.http_api._load_base_cli_settings",
+        _base_openai_settings,
+    )
+
+    async def fake_translate_stream(_settings, _file_path, *, raise_on_error=True):
+        assert raise_on_error is False
+        yield {
+            "type": "finish",
+            "translate_result": SimpleNamespace(
+                mono_pdf_path=mono_path,
+                dual_pdf_path=None,
+                auto_extracted_glossary_path=None,
+                total_seconds=1.0,
+            ),
+            "token_usage": {"main": {"total": 3}},
+        }
+
+    monkeypatch.setattr(
+        "pdf2zh_next.http_api.do_translate_async_stream",
+        fake_translate_stream,
+    )
+
+    client = _client()
+    try:
+        response = client.post(
+            "/jobs",
+            data={"payload": _job_payload()},
+            files={"file": ("paper.pdf", b"%PDF-1.4\n", "application/pdf")},
+        )
+
+        assert response.status_code == 202
+        job_payload = response.json()
+        assert job_payload["status"] in {"queued", "running"}
+
+        job_status = client.get(f"/jobs/{job_payload['job_id']}")
+        assert job_status.status_code == 200
+        payload = job_status.json()
+        assert payload["service"] == "OpenAI"
+
+        deadline = time.time() + 2
+        while time.time() < deadline:
+            current = client.get(f"/jobs/{job_payload['job_id']}").json()
+            if current["status"] == "succeeded":
+                break
+            time.sleep(0.05)
+        else:
+            raise AssertionError("job did not finish in time")
+
+        assert current["result"]["mono_download_url"].startswith("/requests/")
+    finally:
+        client.close()
+
+
+def test_jobs_queue_full(monkeypatch):
+    monkeypatch.setattr(
+        "pdf2zh_next.http_api._load_base_cli_settings",
+        _base_openai_settings,
+    )
+
+    async def slow_translate_stream(_settings, _file_path, *, raise_on_error=True):
+        assert raise_on_error is False
+        yield {
+            "type": "progress_update",
+            "stage": "Running",
+            "overall_progress": 10,
+            "part_index": 1,
+            "total_parts": 1,
+            "stage_current": 1,
+            "stage_total": 2,
+        }
+        await asyncio.sleep(0.5)
+        yield {
+            "type": "finish",
+            "translate_result": SimpleNamespace(
+                mono_pdf_path=None,
+                dual_pdf_path=None,
+                auto_extracted_glossary_path=None,
+                total_seconds=0.5,
+            ),
+            "token_usage": {},
+        }
+
+    monkeypatch.setattr(
+        "pdf2zh_next.http_api.do_translate_async_stream",
+        slow_translate_stream,
+    )
+
+    settings = HTTPServerSettings(
+        allow_local_input_file=True,
+        enable_file_url=True,
+        max_concurrent_jobs=1,
+        max_queue_size=1,
+    )
+    client = _client(server_settings=settings)
+    try:
+        first = client.post(
+            "/jobs",
+            data={"payload": _job_payload()},
+            files={"file": ("paper1.pdf", b"%PDF-1.4\n", "application/pdf")},
+        )
+        assert first.status_code == 202
+
+        deadline = time.time() + 2
+        while time.time() < deadline:
+            current = client.get(f"/jobs/{first.json()['job_id']}").json()
+            if current["status"] == "running":
+                break
+            time.sleep(0.05)
+        else:
+            raise AssertionError("first job did not start")
+
+        second = client.post(
+            "/jobs",
+            data={"payload": _job_payload()},
+            files={"file": ("paper2.pdf", b"%PDF-1.4\n", "application/pdf")},
+        )
+        assert second.status_code == 202
+        assert second.json()["status"] == "queued"
+        second_job_id = second.json()["job_id"]
+
+        third = client.post(
+            "/jobs",
+            data={"payload": _job_payload()},
+            files={"file": ("paper3.pdf", b"%PDF-1.4\n", "application/pdf")},
+        )
+        assert third.status_code == 429
+        assert third.json()["error"]["code"] == "queue_full"
+
+        cancelled = client.post(f"/jobs/{second_job_id}/cancel")
+        assert cancelled.status_code == 200
+    finally:
+        client.close()
+
+
+def test_cleanup_expires_job_artifacts(monkeypatch, tmp_path):
+    mono_path = tmp_path / "paper-mono.pdf"
+    mono_path.write_bytes(b"%PDF-1.4\n")
+
+    monkeypatch.setattr(
+        "pdf2zh_next.http_api._load_base_cli_settings",
+        _base_openai_settings,
+    )
+
+    async def fake_translate_stream(_settings, _file_path, *, raise_on_error=True):
+        assert raise_on_error is False
+        yield {
+            "type": "finish",
+            "translate_result": SimpleNamespace(
+                mono_pdf_path=mono_path,
+                dual_pdf_path=None,
+                auto_extracted_glossary_path=None,
+                total_seconds=0.1,
+            ),
+            "token_usage": {},
+        }
+
+    monkeypatch.setattr(
+        "pdf2zh_next.http_api.do_translate_async_stream",
+        fake_translate_stream,
+    )
+
+    client = _client()
+    try:
+        response = client.post(
+            "/jobs",
+            data={"payload": _job_payload()},
+            files={"file": ("paper.pdf", b"%PDF-1.4\n", "application/pdf")},
+        )
+        assert response.status_code == 202
+        job_id = response.json()["job_id"]
+
+        deadline = time.time() + 2
+        while time.time() < deadline:
+            current = client.get(f"/jobs/{job_id}").json()
+            if current["status"] == "succeeded":
+                break
+            time.sleep(0.05)
+        else:
+            raise AssertionError("job did not finish in time")
+
+        request_id = current["request_id"]
+        output_dir = Path(current["output_dir"])
+        assert output_dir.exists()
+
+        job = client.app.state.job_manager._jobs[job_id]
+        job.expires_at = job.finished_at
+        client.portal.call(client.app.state.job_manager.cleanup_expired_jobs)
+
+        expired = client.get(f"/jobs/{job_id}")
+        assert expired.status_code == 200
+        assert expired.json()["status"] == "expired"
+        assert not output_dir.exists()
+
+        artifact_url = f"/requests/{request_id}/artifacts/source"
+        missing = client.get(artifact_url)
+        assert missing.status_code == 404
+    finally:
+        client.close()
+
+
+def test_runtime_noise_filter_downgrades_known_babeldoc_font_parse_error(caplog):
+    create_app()
+    noisy_logger = logging.getLogger(
+        "babeldoc.format.pdf.document_il.frontend.il_creater"
+    )
+
+    with caplog.at_level(logging.WARNING):
+        noisy_logger.error(
+            "failed to parse font xobj id 2592: FT_Exception: (invalid argument)"
+        )
+        noisy_logger.error("different babeldoc error")
+
+    matching_record = next(
+        record
+        for record in caplog.records
+        if "failed to parse font xobj id 2592" in record.getMessage()
+    )
+    assert matching_record.levelno == logging.WARNING
+
+    other_record = next(
+        record for record in caplog.records if record.getMessage() == "different babeldoc error"
+    )
+    assert other_record.levelno == logging.ERROR
+
+
+def test_runtime_noise_filter_ignores_specific_sklearn_parallel_warning():
+    warning_message = (
+        "`sklearn.utils.parallel.delayed` should be used with "
+        "`sklearn.utils.parallel.Parallel` to make it possible to propagate "
+        "the scikit-learn configuration of the current thread to the joblib workers."
+    )
+
+    with warnings.catch_warnings(record=True) as caught:
+        http_api_module._RUNTIME_NOISE_FILTERS_CONFIGURED = False
+        _configure_runtime_noise_filters()
+        warnings.warn_explicit(
+            warning_message,
+            UserWarning,
+            filename="parallel.py",
+            lineno=144,
+            module="sklearn.utils.parallel",
+        )
+    assert caught == []
+
+    with warnings.catch_warnings(record=True) as caught:
+        http_api_module._RUNTIME_NOISE_FILTERS_CONFIGURED = False
+        _configure_runtime_noise_filters()
+        warnings.warn_explicit(
+            "another sklearn warning",
+            UserWarning,
+            filename="parallel.py",
+            lineno=145,
+            module="sklearn.utils.parallel",
+        )
+    assert len(caught) == 1

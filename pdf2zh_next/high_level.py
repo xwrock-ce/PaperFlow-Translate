@@ -704,7 +704,12 @@ async def do_translate_async_stream(
     settings.validate_settings()
     file = validate_pdf_file(file)
 
-    if settings.basic.input_files and len(settings.basic.input_files):
+    normalized_file = str(Path(file).expanduser().resolve())
+    configured_inputs = {
+        str(Path(input_file.strip("\"'")).expanduser().resolve())
+        for input_file in settings.basic.input_files
+    }
+    if configured_inputs and configured_inputs != {normalized_file}:
         logger.warning(
             "settings.basic.input_files is for cli & config, "
             "pdf2zh_next.highlevel.do_translate_async_stream will ignore this field "

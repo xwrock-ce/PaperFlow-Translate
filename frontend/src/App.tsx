@@ -30,7 +30,7 @@ import type {
 
 type FieldValues = Record<string, string | number | boolean | null>;
 type SettingsTab = "engine" | "translation" | "pdf";
-type WorkspaceSection = "overview" | "source" | "route" | "settings" | "results";
+type WorkspaceSection = "overview" | "source" | "setup" | "results";
 type StatusKey =
   | "loading"
   | "intro"
@@ -467,6 +467,9 @@ function statusMessage(
   if (statusKey === "submitting") {
     return copy.submitting;
   }
+  if (statusKey === "running" && parts.total === 0 && parts.current === 0 && !result) {
+    return copy.accepted;
+  }
   if (statusKey === "source_missing_upload") {
     return copy.sourceMissingUpload;
   }
@@ -786,7 +789,7 @@ export default function App(): ReactElement {
     }
 
     if (service !== "SiliconFlowFree" && missingSecretLabels.length > 0) {
-      setActiveSection("settings");
+      setActiveSection("setup");
       setStatusKey("credentials_required");
       return;
     }
@@ -818,6 +821,18 @@ export default function App(): ReactElement {
         },
         controller.signal,
         (event) => {
+          if (event.type === "status") {
+            setStatusKey("running");
+            setRawStage(
+              event.job.status === "queued"
+                ? "Queued"
+                : "Waiting for translation engine",
+            );
+            setProgress(0);
+            setParts({ current: 0, total: 0 });
+            return;
+          }
+
           if (event.type === "progress") {
             setStatusKey("running");
             setRawStage(event.stage ?? null);
@@ -839,6 +854,10 @@ export default function App(): ReactElement {
             setStatusKey("failed");
             setIsRunning(false);
             controllerRef.current = null;
+            return;
+          }
+
+          if (event.type !== "finish") {
             return;
           }
 
@@ -923,22 +942,15 @@ export default function App(): ReactElement {
       badge: sourceReady ? copy.source.previewReady : null,
     },
     {
-      id: "route",
+      id: "setup",
       key: "03",
-      label: workspaceCopy.nav.route,
-      detail: routeCompactLabel,
-      badge: null,
-    },
-    {
-      id: "settings",
-      key: "04",
-      label: workspaceCopy.nav.settings,
+      label: workspaceCopy.nav.setup,
       detail: copy.settings.tabs[activeTab],
       badge: activeService?.fields.length ? String(activeService.fields.length) : null,
     },
     {
       id: "results",
-      key: "05",
+      key: "04",
       label: workspaceCopy.nav.results,
       detail: downloadCount
         ? `${downloadCount} ${workspaceCopy.filesLabel}`
@@ -957,17 +969,13 @@ export default function App(): ReactElement {
           ? locale === "zh"
             ? "来源"
             : "Source"
-          : section.id === "route"
+          : section.id === "setup"
             ? locale === "zh"
-              ? "路线"
-              : "Route"
-            : section.id === "settings"
-              ? locale === "zh"
-                ? "参数"
-                : "Settings"
-              : locale === "zh"
-                ? "结果"
-                : "Results",
+              ? "设置"
+              : "Setup"
+            : locale === "zh"
+              ? "结果"
+              : "Results",
   }));
   const workspaceContextItems = [
     {
@@ -988,14 +996,29 @@ export default function App(): ReactElement {
       value: service,
     },
     {
-      label: copy.launch.pagesLabel,
-      value: pageScopeLabel,
-    },
-    {
       label: copy.launch.outputLabel,
       value: outputModeLabel,
     },
   ];
+  const workspaceHeaderTitle =
+    activeSection === "overview"
+      ? workspaceCopy.titles.overview
+      : activeSection === "source"
+        ? workspaceCopy.titles.source
+        : activeSection === "setup"
+          ? workspaceCopy.titles.setup
+          : workspaceCopy.titles.results;
+  const workspaceHeaderBody =
+    activeSection === "overview"
+      ? workspaceCopy.descriptions.overview
+      : activeSection === "source"
+        ? workspaceCopy.descriptions.source
+        : activeSection === "setup"
+          ? workspaceCopy.descriptions.setup
+          : workspaceCopy.descriptions.results;
+  const activeWorkspaceSection =
+    workspaceSections.find((section) => section.id === activeSection) ??
+    workspaceSections[0];
 
   function renderRouteVisual(extraClassName?: string): ReactElement {
     return (
@@ -1014,10 +1037,20 @@ export default function App(): ReactElement {
 
   const sourcePanel = (
     <section className="panel-card source-card workspace-panel">
-      <div className="section-heading">
-        <p className="section-eyebrow">{copy.source.eyebrow}</p>
-        <h2>{copy.source.title}</h2>
-        <p className="section-copy">{copy.source.body}</p>
+      <div className="route-overview source-overview">
+        <div className="overview-route-shell source-route-shell">
+          <span className="hero-card-label">{copy.launch.routeLabel}</span>
+          {renderRouteVisual()}
+        </div>
+
+        <div className="service-banner source-service-note">
+          <span className="service-banner-title">{copy.source.transportLabel}</span>
+          <p>
+            {sourceTransportLabel}
+            {" · "}
+            {copy.source.safetyValue}
+          </p>
+        </div>
       </div>
 
       <div className="mode-toggle">
@@ -1091,151 +1124,146 @@ export default function App(): ReactElement {
     </section>
   );
 
-  const routePanel = (
-    <section className="panel-card route-card workspace-panel">
-      <div className="section-heading">
-        <p className="section-eyebrow">{copy.route.eyebrow}</p>
-        <h2>{copy.route.title}</h2>
-        <p className="section-copy">{copy.route.body}</p>
+  const setupPanel = (
+    <section className="panel-card setup-panel workspace-panel">
+      <div className="setup-composer">
+        <section className="setup-route-panel">
+          <div className="setup-panel-header">
+            <span className="hero-card-label">{copy.launch.routeLabel}</span>
+            {renderRouteVisual("route-visual-hero")}
+          </div>
+
+          <div className="route-language-grid">
+            <label className="field">
+              <span className="field-label">{copy.route.sourceLanguage}</span>
+              <select
+                className="field-input"
+                value={langIn}
+                onChange={(event) => setLangIn(event.target.value)}
+              >
+                {languageOptions.map((option) => (
+                  <option key={`from-${option.value}`} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+
+            <button
+              className="route-swap-button"
+              type="button"
+              onClick={handleSwapLanguages}
+            >
+              <span aria-hidden="true">⇄</span>
+              <span>{copy.route.swapLanguages}</span>
+            </button>
+
+            <label className="field">
+              <span className="field-label">{copy.route.targetLanguage}</span>
+              <select
+                className="field-input"
+                value={langOut}
+                onChange={(event) => setLangOut(event.target.value)}
+              >
+                {languageOptions.map((option) => (
+                  <option key={`to-${option.value}`} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+          </div>
+        </section>
+
+        <section className="setup-engine-panel">
+          <div className="setup-panel-header">
+            <span className="hero-card-label">{copy.launch.engineLabel}</span>
+            <strong>{service}</strong>
+            <p>
+              {service === "SiliconFlowFree"
+                ? copy.route.freeEngineBody
+                : copy.route.privateEngineBody}
+            </p>
+          </div>
+
+          <label className="field route-service-field route-service-field-full">
+            <span className="field-label">{copy.route.service}</span>
+            <select
+              className="field-input"
+              value={service}
+              onChange={(event) => handleServiceChange(event.target.value)}
+            >
+              {appConfig.services.map((item) => (
+                <option key={item.name} value={item.name}>
+                  {item.name}
+                </option>
+              ))}
+            </select>
+          </label>
+        </section>
       </div>
 
-      <div className="route-overview">
-        <div className="overview-route-shell route-overview-shell">
-          <span className="hero-card-label">{copy.launch.routeLabel}</span>
-          {renderRouteVisual("route-visual-hero")}
+      <section className="setup-settings-panel">
+        <div className="setup-settings-header">
+          <div className="section-heading section-heading-compact">
+            <p className="section-eyebrow">{copy.settings.eyebrow}</p>
+            <h3>{copy.settings.titles[activeTab]}</h3>
+            <p className="section-copy">{copy.settings.descriptions[activeTab]}</p>
+          </div>
+
+          <div className="settings-tabs">
+            {(["engine", "translation", "pdf"] as const).map((tab) => (
+              <button
+                key={tab}
+                className={activeTab === tab ? "tab-active" : undefined}
+                type="button"
+                onClick={() => setActiveTab(tab)}
+              >
+                {copy.settings.tabs[tab]}
+              </button>
+            ))}
+          </div>
         </div>
 
-        <div className="service-banner route-service-note">
-          <span className="service-banner-title">
-            {service === "SiliconFlowFree"
-              ? copy.route.freeEngineTitle
-              : copy.route.privateEngineTitle}
-          </span>
-          <p>
-            {service === "SiliconFlowFree"
-              ? copy.route.freeEngineBody
-              : copy.route.privateEngineBody}
-          </p>
-        </div>
-      </div>
-
-      <div className="route-language-grid">
-        <label className="field">
-          <span className="field-label">{copy.route.sourceLanguage}</span>
-          <select
-            className="field-input"
-            value={langIn}
-            onChange={(event) => setLangIn(event.target.value)}
-          >
-            {languageOptions.map((option) => (
-              <option key={`from-${option.value}`} value={option.value}>
-                {option.label}
-              </option>
-            ))}
-          </select>
-        </label>
-
-        <button
-          className="route-swap-button"
-          type="button"
-          onClick={handleSwapLanguages}
-        >
-          <span aria-hidden="true">⇄</span>
-          <span>{copy.route.swapLanguages}</span>
-        </button>
-
-        <label className="field">
-          <span className="field-label">{copy.route.targetLanguage}</span>
-          <select
-            className="field-input"
-            value={langOut}
-            onChange={(event) => setLangOut(event.target.value)}
-          >
-            {languageOptions.map((option) => (
-              <option key={`to-${option.value}`} value={option.value}>
-                {option.label}
-              </option>
-            ))}
-          </select>
-        </label>
-      </div>
-
-      <label className="field route-service-field">
-        <span className="field-label">{copy.route.service}</span>
-        <select
-          className="field-input"
-          value={service}
-          onChange={(event) => handleServiceChange(event.target.value)}
-        >
-          {appConfig.services.map((item) => (
-            <option key={item.name} value={item.name}>
-              {item.name}
-            </option>
-          ))}
-        </select>
-      </label>
-    </section>
-  );
-
-  const settingsPanel = (
-    <section className="panel-card settings-board workspace-panel">
-      <div className="section-heading">
-        <p className="section-eyebrow">{copy.settings.eyebrow}</p>
-        <h2>{copy.settings.titles[activeTab]}</h2>
-        <p className="section-copy">{copy.settings.descriptions[activeTab]}</p>
-      </div>
-
-      <div className="settings-tabs">
-        {(["engine", "translation", "pdf"] as const).map((tab) => (
-          <button
-            key={tab}
-            className={activeTab === tab ? "tab-active" : undefined}
-            type="button"
-            onClick={() => setActiveTab(tab)}
-          >
-            {copy.settings.tabs[tab]}
-          </button>
-        ))}
-      </div>
-
-      <SettingsSection
-        title={copy.settings.titles[activeTab]}
-        eyebrow={copy.settings.tabs[activeTab]}
-        description={copy.settings.descriptions[activeTab]}
-        emptyMessage={
-          noEngineFields
-            ? locale === "zh"
-              ? "当前引擎没有额外的前端配置项。"
-              : "This engine does not expose extra frontend settings."
-            : undefined
-        }
-        locale={locale}
-        fieldLabels={{
-          leaveBlank: copy.field.leaveBlankSecret,
-          required: copy.field.required,
-          optional: copy.field.optional,
-          useDefault: copy.field.useDefault,
-        }}
-        fields={activeTabFields}
-        values={
-          activeTab === "engine"
-            ? engineValues
-            : activeTab === "translation"
-              ? translationValues
-              : pdfValues
-        }
-        onChange={(name, value) => {
-          if (activeTab === "engine") {
-            updateFieldValues(setEngineValues, name, value);
-            return;
+        <SettingsSection
+          title={copy.settings.titles[activeTab]}
+          eyebrow={copy.settings.tabs[activeTab]}
+          description={copy.settings.descriptions[activeTab]}
+          emptyMessage={
+            noEngineFields
+              ? locale === "zh"
+                ? "当前引擎没有额外的前端配置项。"
+                : "This engine does not expose extra frontend settings."
+              : undefined
           }
-          if (activeTab === "translation") {
-            updateFieldValues(setTranslationValues, name, value);
-            return;
+          locale={locale}
+          fieldLabels={{
+            leaveBlank: copy.field.leaveBlankSecret,
+            required: copy.field.required,
+            optional: copy.field.optional,
+            useDefault: copy.field.useDefault,
+          }}
+          fields={activeTabFields}
+          values={
+            activeTab === "engine"
+              ? engineValues
+              : activeTab === "translation"
+                ? translationValues
+                : pdfValues
           }
-          updateFieldValues(setPdfValues, name, value);
-        }}
-      />
+          onChange={(name, value) => {
+            if (activeTab === "engine") {
+              updateFieldValues(setEngineValues, name, value);
+              return;
+            }
+            if (activeTab === "translation") {
+              updateFieldValues(setTranslationValues, name, value);
+              return;
+            }
+            updateFieldValues(setPdfValues, name, value);
+          }}
+        />
+      </section>
     </section>
   );
 
@@ -1268,17 +1296,17 @@ export default function App(): ReactElement {
 
   const overviewPanel = (
     <section className="panel-card overview-panel workspace-panel">
-      <div className="overview-hero">
-        <div className="overview-copy">
-          <p className="section-eyebrow">{workspaceCopy.nav.overview}</p>
-          <h2>{currentWorkspaceState}</h2>
+      <div className="overview-status-grid">
+        <div className="summary-pill summary-pill-primary">
+          <span className="summary-label">{copy.launch.stateLabel}</span>
+          <strong>{currentWorkspaceState}</strong>
           <p className="section-copy">{currentMessage}</p>
         </div>
 
-        <div className="launch-focus">
+        <div className="summary-pill">
           <span className="summary-label">{copy.launch.backendStageLabel}</span>
           <strong>{currentStage}</strong>
-          <p>{currentMessage}</p>
+          <p className="section-copy">{progressPercentLabel}</p>
         </div>
       </div>
 
@@ -1419,11 +1447,8 @@ export default function App(): ReactElement {
     case "source":
       primaryContent = sourcePanel;
       break;
-    case "route":
-      primaryContent = routePanel;
-      break;
-    case "settings":
-      primaryContent = settingsPanel;
+    case "setup":
+      primaryContent = setupPanel;
       break;
     case "results":
       primaryContent = resultsPanel;
@@ -1477,19 +1502,27 @@ export default function App(): ReactElement {
 
         <main className="app-workspace">
           <header className="workspace-topbar">
-            <div
-              className="workspace-context-bar"
-              aria-label={workspaceCopy.contextTitle}
-            >
-              {workspaceContextItems.map((item) => (
-                <div
-                  key={item.label}
-                  className={`workspace-context-chip${item.tone ? ` workspace-context-chip-${item.tone}` : ""}`}
-                >
-                  <span className="workspace-context-label">{item.label}</span>
-                  <strong>{item.value}</strong>
-                </div>
-              ))}
+            <div className="workspace-header-main">
+              <div className="workspace-title-block">
+                <p className="section-eyebrow">{activeWorkspaceSection.label}</p>
+                <h1>{workspaceHeaderTitle}</h1>
+                <p className="section-copy">{workspaceHeaderBody}</p>
+              </div>
+
+              <div
+                className="workspace-context-bar"
+                aria-label={workspaceCopy.contextTitle}
+              >
+                {workspaceContextItems.map((item) => (
+                  <div
+                    key={item.label}
+                    className={`workspace-context-chip${item.tone ? ` workspace-context-chip-${item.tone}` : ""}`}
+                  >
+                    <span className="workspace-context-label">{item.label}</span>
+                    <strong>{item.value}</strong>
+                  </div>
+                ))}
+              </div>
             </div>
 
             <section

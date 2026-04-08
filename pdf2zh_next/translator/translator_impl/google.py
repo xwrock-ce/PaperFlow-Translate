@@ -14,6 +14,7 @@ from tenacity import stop_after_attempt
 from tenacity import wait_exponential
 
 logger = logging.getLogger(__name__)
+_GOOGLE_REQUEST_TIMEOUT_SECONDS = 10
 
 
 def remove_control_characters(s):
@@ -37,10 +38,11 @@ class GoogleTranslator(BaseTranslator):
         }
 
     @retry(
-        retry=retry_if_exception_type(Exception),
-        stop=stop_after_attempt(5),
-        wait=wait_exponential(multiplier=1, min=1, max=15),
+        retry=retry_if_exception_type((requests.RequestException, ValueError)),
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=1, max=5),
         before_sleep=before_sleep_log(logger, logging.WARNING),
+        reraise=True,
     )
     def do_translate(self, text, rate_limit_params: dict = None):
         text = text[:5000]  # google translate max length
@@ -48,13 +50,16 @@ class GoogleTranslator(BaseTranslator):
             self.endpoint,
             params={"tl": self.lang_out, "sl": self.lang_in, "q": text},
             headers=self.headers,
-        )
-        re_result = re.findall(
-            r'(?s)class="(?:t0|result-container)">(.*?)<', response.text
+            timeout=_GOOGLE_REQUEST_TIMEOUT_SECONDS,
         )
         if response.status_code == 400:
             result = "IRREPARABLE TRANSLATION ERROR"
         else:
             response.raise_for_status()
+            re_result = re.findall(
+                r'(?s)class="(?:t0|result-container)">(.*?)<', response.text
+            )
+            if not re_result:
+                raise ValueError("Google Translate returned no translation result.")
             result = html.unescape(re_result[0])
         return remove_control_characters(result)

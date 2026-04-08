@@ -1,9 +1,21 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import mimetypes
+import os
+import re
+import shutil
 import uuid
+import warnings
+from contextlib import asynccontextmanager
+from contextlib import suppress
+from dataclasses import dataclass
+from dataclasses import field
+from datetime import datetime
+from datetime import timedelta
+from datetime import timezone
 from pathlib import Path
 from typing import Annotated
 from typing import Any
@@ -58,6 +70,15 @@ _ARTIFACT_MANIFEST_NAME = "artifacts.json"
 _SOURCE_ARTIFACT_NAME = "source"
 _SOURCE_FILE_NAME = "source.pdf"
 TERM_SERVICE_FOLLOW_MAIN = "Follow main translation engine"
+_NON_FATAL_BABELDOC_FONT_XOBJ_PATTERN = re.compile(
+    r"failed to parse font xobj id .*FT_Exception:.*invalid argument",
+    re.IGNORECASE,
+)
+_SKLEARN_PARALLEL_WARNING_PATTERN = (
+    r".*`sklearn\.utils\.parallel\.delayed` should be used with "
+    r"`sklearn\.utils\.parallel\.Parallel`.*"
+)
+_RUNTIME_NOISE_FILTERS_CONFIGURED = False
 
 
 class APIError(Exception):
@@ -89,6 +110,11 @@ class HealthResponse(BaseModel):
     status: str
     version: str
     default_config_file: str
+    running_jobs: int
+    queued_jobs: int
+    max_concurrent_jobs: int
+    max_queue_size: int
+    job_retention_minutes: int
 
 
 class TranslationArtifact(BaseModel):
@@ -238,6 +264,573 @@ class TranslateResponse(BaseModel):
     downloads: dict[str, TranslationArtifact] = Field(default_factory=dict)
 
 
+class HTTPServerSettings(BaseModel):
+    max_concurrent_jobs: int = Field(default=2, ge=1)
+    max_queue_size: int = Field(default=32, ge=1)
+    max_upload_size_mb: int = Field(default=100, ge=1)
+    job_retention_minutes: int = Field(default=30, ge=1)
+    cleanup_interval_minutes: int = Field(default=5, ge=1)
+    metadata_retention_minutes: int = Field(default=24 * 60, ge=1)
+    enable_file_url: bool = Field(default=False)
+    allow_local_input_file: bool = Field(default=False)
+
+
+class JobError(BaseModel):
+    code: str
+    message: str
+    hint: str | None = None
+    details: Any = None
+
+
+class JobProgress(BaseModel):
+    stage: str | None = None
+    overall_progress: float | None = None
+    part_index: int | None = None
+    total_parts: int | None = None
+    stage_current: int | None = None
+    stage_total: int | None = None
+
+
+class JobResponse(BaseModel):
+    job_id: str
+    request_id: str
+    status: str
+    service: str
+    input_file: str
+    output_dir: str
+    submitted_at: str
+    started_at: str | None = None
+    finished_at: str | None = None
+    expires_at: str | None = None
+    queue_position: int | None = None
+    progress: JobProgress | None = None
+    error: JobError | None = None
+    result: TranslateResponse | None = None
+    retention_seconds: int | None = None
+
+
+class JobListResponse(BaseModel):
+    jobs: list[JobResponse]
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _dt_to_iso8601(value: datetime | None) -> str | None:
+    return value.isoformat() if value else None
+
+
+class _NonFatalBabeldocNoiseFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        if (
+            record.levelno >= logging.ERROR
+            and record.name == "babeldoc.format.pdf.document_il.frontend.il_creater"
+            and _NON_FATAL_BABELDOC_FONT_XOBJ_PATTERN.search(record.getMessage())
+        ):
+            record.levelno = logging.WARNING
+            record.levelname = logging.getLevelName(logging.WARNING)
+        return True
+
+
+def _configure_runtime_noise_filters() -> None:
+    global _RUNTIME_NOISE_FILTERS_CONFIGURED
+
+    if _RUNTIME_NOISE_FILTERS_CONFIGURED:
+        return
+
+    warnings.filterwarnings(
+        "ignore",
+        message=_SKLEARN_PARALLEL_WARNING_PATTERN,
+        category=UserWarning,
+        module=r"sklearn\.utils\.parallel",
+    )
+
+    babeldoc_logger = logging.getLogger(
+        "babeldoc.format.pdf.document_il.frontend.il_creater"
+    )
+    if not any(
+        isinstance(existing_filter, _NonFatalBabeldocNoiseFilter)
+        for existing_filter in babeldoc_logger.filters
+    ):
+        babeldoc_logger.addFilter(_NonFatalBabeldocNoiseFilter())
+
+    _RUNTIME_NOISE_FILTERS_CONFIGURED = True
+
+
+def _service_supports_llm(service_name: str | None) -> bool:
+    metadata = TRANSLATION_ENGINE_METADATA_MAP.get(service_name or "")
+    return bool(metadata and metadata.support_llm)
+
+
+def _disable_auto_term_extraction_for_non_llm(settings: Any) -> bool:
+    service_name = settings.translate_engine_settings.translate_engine_type
+    if _service_supports_llm(service_name):
+        return False
+
+    settings.term_extraction_engine_settings = None
+    if settings.translation.no_auto_extract_glossary:
+        return False
+
+    settings.translation.no_auto_extract_glossary = True
+    logger.info(
+        "Automatic term extraction disabled for service=%s because it does not support LLM.",
+        service_name,
+    )
+    return True
+
+
+@dataclass
+class _TranslationJob:
+    job_id: str
+    request_id: str
+    service: str
+    input_file: str
+    output_dir: str
+    file_path: Path
+    settings: Any
+    status: str = "queued"
+    submitted_at: datetime = field(default_factory=_utc_now)
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    expires_at: datetime | None = None
+    progress: dict[str, Any] = field(default_factory=dict)
+    error: dict[str, Any] | None = None
+    result: TranslateResponse | None = None
+    cancel_requested: bool = False
+    done_event: asyncio.Event = field(default_factory=asyncio.Event)
+    execution_task: asyncio.Task | None = None
+    subscribers: set[asyncio.Queue] = field(default_factory=set)
+
+
+class TranslationJobManager:
+    def __init__(self, server_settings: HTTPServerSettings) -> None:
+        self.server_settings = server_settings
+        self._jobs: dict[str, _TranslationJob] = {}
+        self._request_to_job_id: dict[str, str] = {}
+        self._queue: asyncio.Queue[str] = asyncio.Queue()
+        self._queued_job_ids: list[str] = []
+        self._lock = asyncio.Lock()
+        self._workers: list[asyncio.Task] = []
+        self._cleanup_task: asyncio.Task | None = None
+        self._started = False
+        self._metrics = {
+            "submitted": 0,
+            "succeeded": 0,
+            "failed": 0,
+            "cancelled": 0,
+            "expired": 0,
+        }
+
+    async def start(self) -> None:
+        if self._started:
+            return
+        _HTTP_OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
+        self._workers = [
+            asyncio.create_task(self._worker_loop(index), name=f"translation-worker-{index}")
+            for index in range(self.server_settings.max_concurrent_jobs)
+        ]
+        self._cleanup_task = asyncio.create_task(
+            self._cleanup_loop(),
+            name="translation-cleanup",
+        )
+        self._started = True
+
+    async def shutdown(self) -> None:
+        if not self._started:
+            return
+        for job in list(self._jobs.values()):
+            if job.execution_task and not job.execution_task.done():
+                job.cancel_requested = True
+                job.execution_task.cancel()
+        for worker in self._workers:
+            worker.cancel()
+        if self._cleanup_task:
+            self._cleanup_task.cancel()
+        for task in [*self._workers, self._cleanup_task]:
+            if task is None:
+                continue
+            with suppress(asyncio.CancelledError, asyncio.TimeoutError):
+                await asyncio.wait_for(task, timeout=2)
+        self._workers.clear()
+        self._cleanup_task = None
+        self._started = False
+
+    async def submit_job(
+        self,
+        *,
+        request_id: str,
+        service: str,
+        file_path: Path,
+        output_dir: Path,
+        settings: Any,
+    ) -> _TranslationJob:
+        async with self._lock:
+            if len(self._queued_job_ids) >= self.server_settings.max_queue_size:
+                raise APIError(
+                    status_code=429,
+                    code="queue_full",
+                    message="The translation queue is full.",
+                    hint="Please retry after some jobs finish.",
+                )
+            job = _TranslationJob(
+                job_id=str(uuid.uuid4()),
+                request_id=request_id,
+                service=service,
+                input_file=str(file_path),
+                output_dir=str(output_dir),
+                file_path=file_path,
+                settings=settings,
+            )
+            self._jobs[job.job_id] = job
+            self._request_to_job_id[job.request_id] = job.job_id
+            self._queued_job_ids.append(job.job_id)
+            self._metrics["submitted"] += 1
+        await self._queue.put(job.job_id)
+        await self._publish(job, self._event_payload(job, "queued"))
+        return job
+
+    async def wait_for_completion(self, job_id: str) -> _TranslationJob:
+        job = await self.get_job(job_id)
+        await job.done_event.wait()
+        return job
+
+    async def get_job(self, job_id: str) -> _TranslationJob:
+        async with self._lock:
+            job = self._jobs.get(job_id)
+        if job is None:
+            raise APIError(
+                status_code=404,
+                code="job_not_found",
+                message="The requested job does not exist.",
+            )
+        return job
+
+    async def get_job_by_request_id(self, request_id: str) -> _TranslationJob | None:
+        async with self._lock:
+            job_id = self._request_to_job_id.get(request_id)
+            return self._jobs.get(job_id) if job_id else None
+
+    async def list_jobs(self, *, limit: int = 50) -> list[_TranslationJob]:
+        async with self._lock:
+            jobs = sorted(
+                self._jobs.values(),
+                key=lambda item: item.submitted_at,
+                reverse=True,
+            )
+        return jobs[:limit]
+
+    async def cancel_job(self, job_id: str) -> _TranslationJob:
+        job = await self.get_job(job_id)
+        async with self._lock:
+            if job.status == "queued":
+                job.cancel_requested = True
+                job.status = "cancelled"
+                job.finished_at = _utc_now()
+                job.expires_at = job.finished_at + timedelta(
+                    minutes=self.server_settings.job_retention_minutes
+                )
+                if job.job_id in self._queued_job_ids:
+                    self._queued_job_ids.remove(job.job_id)
+                self._metrics["cancelled"] += 1
+                job.done_event.set()
+                event = self._event_payload(job, "cancelled")
+            elif job.status == "running" and job.execution_task:
+                job.cancel_requested = True
+                job.execution_task.cancel()
+                event = None
+            else:
+                event = None
+        if event:
+            await self._publish(job, event)
+        return job
+
+    async def subscribe(self, job_id: str) -> tuple[_TranslationJob, asyncio.Queue]:
+        job = await self.get_job(job_id)
+        queue: asyncio.Queue = asyncio.Queue()
+        async with self._lock:
+            job.subscribers.add(queue)
+        await queue.put(self._event_payload(job, "snapshot"))
+        return job, queue
+
+    async def unsubscribe(self, job: _TranslationJob, queue: asyncio.Queue) -> None:
+        async with self._lock:
+            job.subscribers.discard(queue)
+
+    async def build_job_response(self, job_id: str) -> JobResponse:
+        job = await self.get_job(job_id)
+        return self._job_response(job)
+
+    def health_payload(self) -> dict[str, int]:
+        running_jobs = sum(1 for job in self._jobs.values() if job.status == "running")
+        queued_jobs = len(self._queued_job_ids)
+        return {
+            "running_jobs": running_jobs,
+            "queued_jobs": queued_jobs,
+            "max_concurrent_jobs": self.server_settings.max_concurrent_jobs,
+            "max_queue_size": self.server_settings.max_queue_size,
+            "job_retention_minutes": self.server_settings.job_retention_minutes,
+        }
+
+    def metrics_payload(self) -> dict[str, Any]:
+        return {
+            **self._metrics,
+            **self.health_payload(),
+        }
+
+    async def cleanup_expired_jobs(self) -> None:
+        now = _utc_now()
+        expiration_targets: list[_TranslationJob] = []
+        purge_targets: list[str] = []
+        active_request_ids: set[str] = set()
+        async with self._lock:
+            for job in self._jobs.values():
+                if job.status in {"queued", "running"}:
+                    active_request_ids.add(job.request_id)
+                    continue
+                if (
+                    job.expires_at
+                    and now >= job.expires_at
+                    and job.status in {"succeeded", "failed", "cancelled"}
+                ):
+                    expiration_targets.append(job)
+                if (
+                    job.finished_at
+                    and now
+                    >= job.finished_at
+                    + timedelta(minutes=self.server_settings.metadata_retention_minutes)
+                ):
+                    purge_targets.append(job.job_id)
+        for job in expiration_targets:
+            await self._expire_job(job)
+        for orphan_dir in _HTTP_OUTPUT_ROOT.glob("*"):
+            if not orphan_dir.is_dir():
+                continue
+            if orphan_dir.name in active_request_ids:
+                continue
+            try:
+                modified_at = datetime.fromtimestamp(
+                    orphan_dir.stat().st_mtime,
+                    tz=timezone.utc,
+                )
+            except OSError:
+                continue
+            if now >= modified_at + timedelta(
+                minutes=self.server_settings.job_retention_minutes
+            ):
+                shutil.rmtree(orphan_dir, ignore_errors=True)
+        async with self._lock:
+            for job_id in purge_targets:
+                job = self._jobs.pop(job_id, None)
+                if job is None:
+                    continue
+                self._request_to_job_id.pop(job.request_id, None)
+                if job.job_id in self._queued_job_ids:
+                    self._queued_job_ids.remove(job.job_id)
+
+    async def _expire_job(self, job: _TranslationJob) -> None:
+        output_dir = Path(job.output_dir)
+        shutil.rmtree(output_dir, ignore_errors=True)
+        async with self._lock:
+            if job.status == "expired":
+                return
+            job.status = "expired"
+            job.result = None
+            self._metrics["expired"] += 1
+        await self._publish(job, self._event_payload(job, "expired"))
+
+    async def _cleanup_loop(self) -> None:
+        interval = self.server_settings.cleanup_interval_minutes * 60
+        while True:
+            await asyncio.sleep(interval)
+            await self.cleanup_expired_jobs()
+
+    async def _worker_loop(self, _index: int) -> None:
+        while True:
+            try:
+                job_id = await self._queue.get()
+            except asyncio.CancelledError:
+                return
+            try:
+                job = await self.get_job(job_id)
+            except APIError:
+                self._queue.task_done()
+                continue
+            try:
+                async with self._lock:
+                    if job.status == "cancelled":
+                        continue
+                    if job.job_id in self._queued_job_ids:
+                        self._queued_job_ids.remove(job.job_id)
+                execution_task = asyncio.create_task(self._execute_job(job))
+                job.execution_task = execution_task
+                try:
+                    await execution_task
+                except asyncio.CancelledError:
+                    if not execution_task.done():
+                        execution_task.cancel()
+                        with suppress(asyncio.CancelledError):
+                            await execution_task
+                    raise
+            finally:
+                job.execution_task = None
+                self._queue.task_done()
+
+    async def _execute_job(self, job: _TranslationJob) -> None:
+        started_at = _utc_now()
+        async with self._lock:
+            if job.cancel_requested and job.status == "cancelled":
+                return
+            job.status = "running"
+            job.started_at = started_at
+        await self._publish(job, self._event_payload(job, "running"))
+        try:
+            async for event in do_translate_async_stream(
+                job.settings,
+                job.file_path,
+                raise_on_error=False,
+            ):
+                event_type = event.get("type")
+                if event_type in {"progress_start", "progress_update", "progress_end"}:
+                    async with self._lock:
+                        job.progress = {
+                            "stage": event.get("stage"),
+                            "overall_progress": event.get("overall_progress"),
+                            "part_index": event.get("part_index"),
+                            "total_parts": event.get("total_parts"),
+                            "stage_current": event.get("stage_current"),
+                            "stage_total": event.get("stage_total"),
+                        }
+                    await self._publish(job, self._event_payload(job, "progress"))
+                    continue
+                if event_type == "error":
+                    error_message = str(event.get("error", "Translation failed."))
+                    async with self._lock:
+                        job.status = "failed"
+                        job.error = {
+                            "code": "translation_failed",
+                            "message": error_message,
+                            "hint": _build_translation_hint(error_message),
+                            "details": event.get("details"),
+                        }
+                        job.finished_at = _utc_now()
+                        job.expires_at = job.finished_at + timedelta(
+                            minutes=self.server_settings.job_retention_minutes
+                        )
+                        self._metrics["failed"] += 1
+                        job.done_event.set()
+                    await self._publish(job, self._event_payload(job, "error"))
+                    return
+                if event_type == "finish":
+                    response = _build_translate_response(
+                        settings=job.settings,
+                        file_path=job.file_path,
+                        request_id=job.request_id,
+                        output_dir=Path(job.output_dir),
+                        result=event["translate_result"],
+                        token_usage=event.get("token_usage", {}),
+                    )
+                    async with self._lock:
+                        job.status = "succeeded"
+                        job.result = response
+                        job.finished_at = _utc_now()
+                        job.expires_at = job.finished_at + timedelta(
+                            minutes=self.server_settings.job_retention_minutes
+                        )
+                        self._metrics["succeeded"] += 1
+                        job.done_event.set()
+                    await self._publish(job, self._event_payload(job, "finish"))
+                    return
+            async with self._lock:
+                job.status = "failed"
+                job.error = {
+                    "code": "missing_translation_result",
+                    "message": "The translation finished without a result payload.",
+                }
+                job.finished_at = _utc_now()
+                job.expires_at = job.finished_at + timedelta(
+                    minutes=self.server_settings.job_retention_minutes
+                )
+                self._metrics["failed"] += 1
+                job.done_event.set()
+            await self._publish(job, self._event_payload(job, "error"))
+        except asyncio.CancelledError:
+            async with self._lock:
+                job.status = "cancelled"
+                job.finished_at = _utc_now()
+                job.expires_at = job.finished_at + timedelta(
+                    minutes=self.server_settings.job_retention_minutes
+                )
+                self._metrics["cancelled"] += 1
+                job.done_event.set()
+            await self._publish(job, self._event_payload(job, "cancelled"))
+        except Exception as exc:
+            logger.exception("Job %s failed unexpectedly: %s", job.job_id, exc)
+            async with self._lock:
+                job.status = "failed"
+                job.error = {
+                    "code": "internal_error",
+                    "message": "The server hit an unexpected error while processing the job.",
+                    "details": str(exc),
+                }
+                job.finished_at = _utc_now()
+                job.expires_at = job.finished_at + timedelta(
+                    minutes=self.server_settings.job_retention_minutes
+                )
+                self._metrics["failed"] += 1
+                job.done_event.set()
+            await self._publish(job, self._event_payload(job, "error"))
+
+    async def _publish(self, job: _TranslationJob, event: dict[str, Any]) -> None:
+        async with self._lock:
+            subscribers = list(job.subscribers)
+        for subscriber in subscribers:
+            subscriber.put_nowait(event)
+
+    def _event_payload(self, job: _TranslationJob, event_type: str) -> dict[str, Any]:
+        payload = {
+            "type": event_type,
+            "job": self._job_response(job).model_dump(mode="json"),
+        }
+        if event_type == "progress" and job.progress:
+            payload.update(job.progress)
+        if event_type == "finish" and job.result:
+            payload["result"] = job.result.model_dump(mode="json")
+        if event_type == "error" and job.error:
+            payload["error"] = job.error
+        return payload
+
+    def _job_response(self, job: _TranslationJob) -> JobResponse:
+        queue_position = None
+        if job.status == "queued" and job.job_id in self._queued_job_ids:
+            queue_position = self._queued_job_ids.index(job.job_id) + 1
+        retention_seconds = None
+        if job.expires_at:
+            retention_seconds = max(
+                0,
+                int((job.expires_at - _utc_now()).total_seconds()),
+            )
+        progress = JobProgress(**job.progress) if job.progress else None
+        error = JobError(**job.error) if job.error else None
+        return JobResponse(
+            job_id=job.job_id,
+            request_id=job.request_id,
+            status=job.status,
+            service=job.service,
+            input_file=job.input_file,
+            output_dir=job.output_dir,
+            submitted_at=_dt_to_iso8601(job.submitted_at) or "",
+            started_at=_dt_to_iso8601(job.started_at),
+            finished_at=_dt_to_iso8601(job.finished_at),
+            expires_at=_dt_to_iso8601(job.expires_at),
+            queue_position=queue_position,
+            progress=progress,
+            error=error,
+            result=job.result,
+            retention_seconds=retention_seconds,
+        )
+
+
 def _error_payload(
     *,
     code: str,
@@ -364,11 +957,17 @@ def _resolve_service_metadata(service_name: str):
     )
 
 
-def _prepare_request_output_dir(request_id: str, requested_output_dir: str | None) -> Path:
+def _prepare_request_output_dir(
+    request_id: str,
+    requested_output_dir: str | None,
+) -> Path:
     if requested_output_dir:
-        output_dir = Path(requested_output_dir).expanduser()
-    else:
-        output_dir = _HTTP_OUTPUT_ROOT / request_id
+        raise APIError(
+            status_code=400,
+            code="feature_disabled",
+            message="Custom output directories are disabled on the HTTP service.",
+        )
+    output_dir = _HTTP_OUTPUT_ROOT / request_id
     output_dir.mkdir(parents=True, exist_ok=True)
     return output_dir
 
@@ -379,7 +978,17 @@ def _normalize_output_path(path: str | Path | None) -> str | None:
     return Path(path).as_posix()
 
 
-def _download_pdf_from_url(file_url: str, output_dir: Path) -> Path:
+def _download_pdf_from_url(
+    file_url: str,
+    output_dir: Path,
+    server_settings: HTTPServerSettings,
+) -> Path:
+    if not server_settings.enable_file_url:
+        raise APIError(
+            status_code=400,
+            code="feature_disabled",
+            message="Remote PDF URLs are disabled on this server.",
+        )
     normalized_url = file_url.strip()
     parsed = urlparse(normalized_url)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
@@ -391,6 +1000,8 @@ def _download_pdf_from_url(file_url: str, output_dir: Path) -> Path:
 
     file_path = output_dir / _SOURCE_FILE_NAME
     pdf_header = b""
+    total_bytes = 0
+    max_bytes = server_settings.max_upload_size_mb * 1024 * 1024
 
     try:
         with requests.get(normalized_url, stream=True, timeout=15) as response:
@@ -399,10 +1010,20 @@ def _download_pdf_from_url(file_url: str, output_dir: Path) -> Path:
                 for chunk in response.iter_content(chunk_size=1024):
                     if not chunk:
                         continue
+                    total_bytes += len(chunk)
+                    if total_bytes > max_bytes:
+                        raise APIError(
+                            status_code=413,
+                            code="payload_too_large",
+                            message="The downloaded PDF exceeds the server upload limit.",
+                        )
                     if len(pdf_header) < 5:
                         missing = 5 - len(pdf_header)
                         pdf_header += chunk[:missing]
                     output_file.write(chunk)
+    except APIError:
+        file_path.unlink(missing_ok=True)
+        raise
     except requests.RequestException as exc:
         file_path.unlink(missing_ok=True)
         raise APIError(
@@ -434,7 +1055,11 @@ def _download_pdf_from_url(file_url: str, output_dir: Path) -> Path:
         ) from exc
 
 
-async def _save_uploaded_pdf(upload: UploadFile, output_dir: Path) -> Path:
+async def _save_uploaded_pdf(
+    upload: UploadFile,
+    output_dir: Path,
+    server_settings: HTTPServerSettings,
+) -> Path:
     if not upload.filename or not upload.filename.lower().endswith(".pdf"):
         raise APIError(
             status_code=400,
@@ -444,6 +1069,8 @@ async def _save_uploaded_pdf(upload: UploadFile, output_dir: Path) -> Path:
 
     file_path = output_dir / _SOURCE_FILE_NAME
     pdf_header = b""
+    total_bytes = 0
+    max_bytes = server_settings.max_upload_size_mb * 1024 * 1024
 
     try:
         with file_path.open("wb") as output_file:
@@ -451,6 +1078,13 @@ async def _save_uploaded_pdf(upload: UploadFile, output_dir: Path) -> Path:
                 chunk = await upload.read(1024 * 1024)
                 if not chunk:
                     break
+                total_bytes += len(chunk)
+                if total_bytes > max_bytes:
+                    raise APIError(
+                        status_code=413,
+                        code="payload_too_large",
+                        message="The uploaded PDF exceeds the server upload limit.",
+                    )
                 if len(pdf_header) < 5:
                     missing = 5 - len(pdf_header)
                     pdf_header += chunk[:missing]
@@ -477,8 +1111,18 @@ async def _save_uploaded_pdf(upload: UploadFile, output_dir: Path) -> Path:
         ) from exc
 
 
-def _prepare_request_source(request: TranslateRequest, output_dir: Path) -> Path:
+def _prepare_request_source(
+    request: TranslateRequest,
+    output_dir: Path,
+    server_settings: HTTPServerSettings,
+) -> Path:
     if request.input_file:
+        if not server_settings.allow_local_input_file:
+            raise APIError(
+                status_code=400,
+                code="feature_disabled",
+                message="Local server file paths are disabled on this server.",
+            )
         input_path = Path(request.input_file).expanduser()
         try:
             return validate_pdf_file(input_path)
@@ -497,7 +1141,7 @@ def _prepare_request_source(request: TranslateRequest, output_dir: Path) -> Path
                 hint="Pass a readable PDF path in `input_file`.",
             ) from exc
 
-    return _download_pdf_from_url(request.file_url or "", output_dir)
+    return _download_pdf_from_url(request.file_url or "", output_dir, server_settings)
 
 
 def _field_type_name(annotation: Any) -> tuple[str, list[dict[str, Any]] | None]:
@@ -676,15 +1320,15 @@ def _build_bootstrap_services(
     term_services: list[dict[str, Any]] = []
     for metadata in TRANSLATION_ENGINE_METADATA:
         fields = []
-        for field_name, field in metadata.setting_model_type.model_fields.items():
+        for field_name, model_field in metadata.setting_model_type.model_fields.items():
             if field_name in {"translate_engine_type", "support_llm"}:
                 continue
             fields.append(
                 _annotation_to_service_field(
                     name=field_name,
-                    description=field.description,
-                    annotation=field.annotation,
-                    default=field.default,
+                    description=model_field.description,
+                    annotation=model_field.annotation,
+                    default=model_field.default,
                     secret=field_name in GUI_PASSWORD_FIELDS,
                 )
             )
@@ -738,6 +1382,10 @@ def _build_ui_bootstrap() -> dict[str, Any]:
     cli_settings = _load_base_cli_settings()
     services, term_services = _build_bootstrap_services(cli_settings)
     service = _selected_service(cli_settings)
+    auto_term_extraction_enabled = (
+        _service_supports_llm(service)
+        and not cli_settings.translation.no_auto_extract_glossary
+    )
     page_mode, page_range_text = _page_mode_from_pages(cli_settings.pdf.pages)
     return {
         "version": __version__,
@@ -759,7 +1407,7 @@ def _build_ui_bootstrap() -> dict[str, Any]:
             "min_text_length": cli_settings.translation.min_text_length,
             "custom_system_prompt": cli_settings.translation.custom_system_prompt or "",
             "save_auto_extracted_glossary": cli_settings.translation.save_auto_extracted_glossary,
-            "enable_auto_term_extraction": not cli_settings.translation.no_auto_extract_glossary,
+            "enable_auto_term_extraction": auto_term_extraction_enabled,
             "primary_font_family": cli_settings.translation.primary_font_family or "Auto",
             "skip_clean": cli_settings.pdf.skip_clean,
             "disable_rich_text_translate": cli_settings.pdf.disable_rich_text_translate,
@@ -844,16 +1492,16 @@ def _coerce_webui_service_config(
         return {}
     model_fields = metadata.setting_model_type.model_fields
     result: dict[str, Any] = {}
-    for key, field in model_fields.items():
+    for key, model_field in model_fields.items():
         if key in {"translate_engine_type", "support_llm"} or key not in values:
             continue
         raw_value = values[key]
-        args = getattr(field.annotation, "__args__", ())
-        if field.annotation is int or int in args:
+        args = getattr(model_field.annotation, "__args__", ())
+        if model_field.annotation is int or int in args:
             result[key] = int(raw_value) if raw_value not in ("", None) else None
-        elif field.annotation is bool or bool in args:
+        elif model_field.annotation is bool or bool in args:
             result[key] = bool(raw_value)
-        elif field.annotation is float or float in args:
+        elif model_field.annotation is float or float in args:
             result[key] = float(raw_value) if raw_value not in ("", None) else None
         else:
             result[key] = raw_value
@@ -916,8 +1564,8 @@ def _build_settings_from_webui(
     for_saved_config: bool = False,
 ) -> tuple[CLIEnvSettingsModel, Any]:
     translate_settings = base_settings.clone()
+    del file_path
     translate_settings.basic.gui = for_saved_config
-    translate_settings.basic.input_files = {str(file_path)} if file_path else set()
     if output_dir is not None:
         translate_settings.translation.output = str(output_dir)
 
@@ -1042,6 +1690,7 @@ def _build_settings_from_webui(
             setattr(detail_settings, key, value)
 
     settings_model = translate_settings.to_settings_model()
+    _disable_auto_term_extraction_for_non_llm(settings_model)
     settings_model.validate_settings()
     return translate_settings, settings_model
 
@@ -1122,12 +1771,12 @@ def _build_settings(
     engine_settings: dict[str, Any],
 ) -> Any:
     cli_settings = _load_base_cli_settings().clone()
+    del file_path
     _set_translation_service(
         cli_settings,
         service_name=service_name,
         engine_settings=engine_settings,
     )
-    cli_settings.basic.input_files = {str(file_path)}
     cli_settings.translation.lang_in = lang_in
     cli_settings.translation.lang_out = lang_out
     cli_settings.translation.output = str(output_dir)
@@ -1140,6 +1789,7 @@ def _build_settings(
 
     try:
         settings = cli_settings.to_settings_model()
+        _disable_auto_term_extraction_for_non_llm(settings)
         settings.validate_settings()
     except ValueError as exc:
         raise APIError(
@@ -1199,10 +1849,11 @@ def _build_web_request_settings(
     output_dir: Path,
 ) -> Any:
     cli_settings = _build_full_cli_settings(payload.settings).clone()
-    cli_settings.basic.input_files = {str(file_path)}
+    del file_path
     cli_settings.translation.output = str(output_dir)
     try:
         settings = cli_settings.to_settings_model()
+        _disable_auto_term_extraction_for_non_llm(settings)
         settings.validate_settings()
     except ValueError as exc:
         raise APIError(
@@ -1214,6 +1865,33 @@ def _build_web_request_settings(
 
     if payload.persist_settings:
         ConfigManager().write_user_default_config_file(cli_settings.clone())
+
+    return settings
+
+
+def _apply_server_resource_caps(
+    settings: Any,
+    server_settings: HTTPServerSettings,
+) -> Any:
+    worker_cap = max(2, os.cpu_count() or 2)
+    qps_cap = max(4, worker_cap * server_settings.max_concurrent_jobs)
+
+    settings.translation.qps = min(settings.translation.qps or qps_cap, qps_cap)
+    settings.translation.term_qps = min(
+        settings.translation.term_qps or settings.translation.qps,
+        qps_cap,
+    )
+
+    if settings.translation.pool_max_workers is not None:
+        settings.translation.pool_max_workers = min(
+            settings.translation.pool_max_workers,
+            worker_cap,
+        )
+    if settings.translation.term_pool_max_workers is not None:
+        settings.translation.term_pool_max_workers = min(
+            settings.translation.term_pool_max_workers,
+            worker_cap,
+        )
 
     return settings
 
@@ -1455,6 +2133,128 @@ def _coerce_json_line(data: dict[str, Any]) -> bytes:
     return (json.dumps(data, ensure_ascii=False) + "\n").encode("utf-8")
 
 
+async def _submit_translation_job(
+    *,
+    job_manager: TranslationJobManager,
+    settings: Any,
+    file_path: Path,
+    request_id: str,
+    output_dir: Path,
+) -> _TranslationJob:
+    capped_settings = _apply_server_resource_caps(
+        settings,
+        job_manager.server_settings,
+    )
+    job = await job_manager.submit_job(
+        request_id=request_id,
+        service=capped_settings.translate_engine_settings.translate_engine_type,
+        file_path=file_path,
+        output_dir=output_dir,
+        settings=capped_settings,
+    )
+    logger.info(
+        "Accepted translation job %s for request %s using service=%s auto_term_extraction=%s.",
+        job.job_id,
+        request_id,
+        job.service,
+        not capped_settings.translation.no_auto_extract_glossary,
+    )
+    return job
+
+
+def _raise_for_terminal_job(job: _TranslationJob) -> TranslateResponse:
+    if job.status == "succeeded" and job.result:
+        return job.result
+    if job.status == "cancelled":
+        raise APIError(
+            status_code=409,
+            code="job_cancelled",
+            message="The translation job was cancelled before completion.",
+        )
+    if job.status == "expired":
+        raise APIError(
+            status_code=410,
+            code="job_expired",
+            message="The translation job has expired and its artifacts were deleted.",
+        )
+    if job.error:
+        raise APIError(
+            status_code=502
+            if job.error.get("code") == "translation_failed"
+            else 500,
+            code=job.error.get("code", "internal_error"),
+            message=job.error.get("message", "Translation failed."),
+            hint=job.error.get("hint"),
+            details=job.error.get("details"),
+        )
+    raise APIError(
+        status_code=500,
+        code="missing_translation_result",
+        message="The translation finished without a result payload.",
+    )
+
+
+def _legacy_stream_event(event: dict[str, Any]) -> dict[str, Any] | None:
+    event_type = event.get("type")
+    job_payload = event.get("job", {})
+    if event_type == "progress":
+        return {
+            "type": "progress",
+            "stage": event.get("stage"),
+            "message": _progress_message(event),
+            "overall_progress": event.get("overall_progress"),
+            "part_index": event.get("part_index"),
+            "total_parts": event.get("total_parts"),
+            "stage_current": event.get("stage_current"),
+            "stage_total": event.get("stage_total"),
+        }
+    if event_type == "error":
+        return {"type": "error", "error": event.get("error")}
+    if event_type == "cancelled":
+        return {
+            "type": "error",
+            "error": {
+                "code": "job_cancelled",
+                "message": "The translation job was cancelled before completion.",
+            },
+        }
+    if event_type == "expired":
+        return {
+            "type": "error",
+            "error": {
+                "code": "job_expired",
+                "message": "The translation job artifacts have expired.",
+            },
+        }
+    if event_type == "finish":
+        return {"type": "finish", "result": event.get("result")}
+    if event_type in {"snapshot", "queued", "running"}:
+        return {
+            "type": "status",
+            "job": job_payload,
+        }
+    return None
+
+
+async def _stream_job_events(
+    job_manager: TranslationJobManager,
+    job_id: str,
+    *,
+    legacy_format: bool = False,
+):
+    job, queue = await job_manager.subscribe(job_id)
+    try:
+        while True:
+            event = await queue.get()
+            payload = _legacy_stream_event(event) if legacy_format else event
+            if payload is not None:
+                yield _coerce_json_line(payload)
+            if event.get("type") in {"finish", "error", "cancelled", "expired"}:
+                return
+    finally:
+        await job_manager.unsubscribe(job, queue)
+
+
 async def _stream_translation_file(
     *,
     settings: Any,
@@ -1554,9 +2354,25 @@ def _serve_frontend(app: FastAPI) -> bool:
     return True
 
 
-def create_app(*, serve_frontend: bool = False, include_frontend: bool | None = None) -> FastAPI:
+def create_app(
+    *,
+    serve_frontend: bool = False,
+    include_frontend: bool | None = None,
+    server_settings: HTTPServerSettings | None = None,
+) -> FastAPI:
     if include_frontend is not None:
         serve_frontend = include_frontend
+    server_settings = server_settings or HTTPServerSettings()
+    _configure_runtime_noise_filters()
+    job_manager = TranslationJobManager(server_settings)
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        await job_manager.start()
+        try:
+            yield
+        finally:
+            await job_manager.shutdown()
 
     app = FastAPI(
         title="PDFMathTranslate Next HTTP API",
@@ -1565,6 +2381,7 @@ def create_app(*, serve_frontend: bool = False, include_frontend: bool | None = 
             "Minimal HTTP API for translating a single PDF with the current "
             "server configuration."
         ),
+        lifespan=lifespan,
     )
     app.add_middleware(
         CORSMiddleware,
@@ -1573,6 +2390,8 @@ def create_app(*, serve_frontend: bool = False, include_frontend: bool | None = 
         allow_methods=["*"],
         allow_headers=["*"],
     )
+    app.state.server_settings = server_settings
+    app.state.job_manager = job_manager
 
     @app.exception_handler(APIError)
     async def api_error_handler(
@@ -1633,10 +2452,16 @@ def create_app(*, serve_frontend: bool = False, include_frontend: bool | None = 
 
     @app.get("/healthz", response_model=HealthResponse, tags=["meta"])
     async def healthz() -> HealthResponse:
+        health_payload = app.state.job_manager.health_payload()
         return HealthResponse(
             status="ok",
             version=__version__,
             default_config_file=str(DEFAULT_CONFIG_FILE),
+            running_jobs=health_payload["running_jobs"],
+            queued_jobs=health_payload["queued_jobs"],
+            max_concurrent_jobs=health_payload["max_concurrent_jobs"],
+            max_queue_size=health_payload["max_queue_size"],
+            job_retention_minutes=health_payload["job_retention_minutes"],
         )
 
     @app.get("/engines", tags=["meta"])
@@ -1691,11 +2516,186 @@ def create_app(*, serve_frontend: bool = False, include_frontend: bool | None = 
         ConfigManager().write_user_default_config_file(cli_settings)
         return {"status": "saved", "config_file": str(DEFAULT_CONFIG_FILE)}
 
+    @app.get("/metrics", tags=["meta"])
+    async def metrics() -> dict[str, Any]:
+        return app.state.job_manager.metrics_payload()
+
+    @app.get("/jobs", response_model=JobListResponse, tags=["jobs"])
+    async def list_jobs(limit: int = 50) -> JobListResponse:
+        jobs = await app.state.job_manager.list_jobs(limit=limit)
+        return JobListResponse(
+            jobs=[
+                app.state.job_manager._job_response(job)
+                for job in jobs
+            ]
+        )
+
+    @app.get("/jobs/{job_id}", response_model=JobResponse, tags=["jobs"])
+    async def get_job(job_id: str) -> JobResponse:
+        return await app.state.job_manager.build_job_response(job_id)
+
+    @app.get("/jobs/{job_id}/events", tags=["jobs"])
+    async def stream_job_events(job_id: str) -> StreamingResponse:
+        return StreamingResponse(
+            _stream_job_events(app.state.job_manager, job_id),
+            media_type="application/x-ndjson",
+        )
+
+    @app.post("/jobs/{job_id}/cancel", response_model=JobResponse, tags=["jobs"])
+    async def cancel_job(job_id: str) -> JobResponse:
+        job = await app.state.job_manager.cancel_job(job_id)
+        return app.state.job_manager._job_response(job)
+
+    async def _wait_for_job_result(job: _TranslationJob) -> TranslateResponse:
+        completed_job = await app.state.job_manager.wait_for_completion(job.job_id)
+        return _raise_for_terminal_job(completed_job)
+
+    async def _create_request_job(request: TranslateRequest) -> _TranslationJob:
+        request_id = str(uuid.uuid4())
+        output_dir = _prepare_request_output_dir(
+            request_id,
+            request.output_dir,
+        )
+        file_path = _prepare_request_source(request, output_dir, server_settings)
+        settings = _build_request_settings(
+            request,
+            file_path=file_path,
+            output_dir=output_dir,
+        )
+        return await _submit_translation_job(
+            job_manager=app.state.job_manager,
+            settings=settings,
+            file_path=file_path,
+            request_id=request_id,
+            output_dir=output_dir,
+        )
+
+    async def _create_browser_job(
+        request: BrowserTranslateRequest,
+        *,
+        file: UploadFile | None,
+        file_url: str | None,
+    ) -> _TranslationJob:
+        if bool(file) == bool(file_url):
+            raise APIError(
+                status_code=422,
+                code="request_validation_failed",
+                message="Provide exactly one of uploaded `file` or `file_url`.",
+            )
+        request_id = str(uuid.uuid4())
+        output_dir = _prepare_request_output_dir(request_id, None)
+        file_path = (
+            await _save_uploaded_pdf(file, output_dir, server_settings)
+            if file
+            else _download_pdf_from_url(file_url or "", output_dir, server_settings)
+        )
+        settings = _build_browser_request_settings(
+            request,
+            file_path=file_path,
+            output_dir=output_dir,
+        )
+        return await _submit_translation_job(
+            job_manager=app.state.job_manager,
+            settings=settings,
+            file_path=file_path,
+            request_id=request_id,
+            output_dir=output_dir,
+        )
+
+    async def _create_webui_job(
+        payload_text: str,
+        *,
+        file: UploadFile | None,
+    ) -> _TranslationJob:
+        if file is None:
+            raise APIError(
+                status_code=400,
+                code="missing_upload",
+                message="Upload a PDF file before starting translation.",
+            )
+        try:
+            webui_payload = _parse_webui_payload(payload_text)
+        except (ValidationError, WebUIError) as exc:
+            raise APIError(
+                status_code=422,
+                code="request_validation_failed",
+                message=str(exc),
+            ) from exc
+        request_id = str(uuid.uuid4())
+        output_dir = _prepare_request_output_dir(request_id, None)
+        file_path = await _save_uploaded_pdf(file, output_dir, server_settings)
+        try:
+            _cli_settings, settings = _build_settings_from_webui(
+                _load_base_cli_settings(),
+                webui_payload,
+                file_path=file_path,
+                output_dir=output_dir,
+            )
+        except WebUIError as exc:
+            raise APIError(
+                status_code=400,
+                code="invalid_translation_settings",
+                message=str(exc),
+            ) from exc
+        return await _submit_translation_job(
+            job_manager=app.state.job_manager,
+            settings=settings,
+            file_path=file_path,
+            request_id=request_id,
+            output_dir=output_dir,
+        )
+
+    async def _create_frontend_job(
+        payload_text: str,
+        *,
+        file: UploadFile | None,
+    ) -> _TranslationJob:
+        try:
+            translate_payload = WebTranslatePayload.model_validate_json(payload_text)
+        except ValidationError as exc:
+            raise APIError(
+                status_code=422,
+                code="request_validation_failed",
+                message="The React translation payload is invalid.",
+                details=exc.errors(),
+            ) from exc
+        request_id = str(uuid.uuid4())
+        output_dir = _prepare_request_output_dir(request_id, None)
+        if translate_payload.source_type == "link":
+            file_path = _download_pdf_from_url(
+                translate_payload.file_url or "",
+                output_dir,
+                server_settings,
+            )
+        else:
+            if file is None:
+                raise APIError(
+                    status_code=400,
+                    code="missing_upload",
+                    message="Upload a PDF file when `source_type` is `file`.",
+                )
+            file_path = await _save_uploaded_pdf(file, output_dir, server_settings)
+        settings = _build_web_request_settings(
+            translate_payload,
+            file_path=file_path,
+            output_dir=output_dir,
+        )
+        return await _submit_translation_job(
+            job_manager=app.state.job_manager,
+            settings=settings,
+            file_path=file_path,
+            request_id=request_id,
+            output_dir=output_dir,
+        )
+
     async def _download_artifact_impl(
         request_id: str,
         artifact_name: str,
         disposition: Literal["attachment", "inline"] = "attachment",
     ) -> FileResponse:
+        job = await app.state.job_manager.get_job_by_request_id(request_id)
+        if job and job.status == "expired":
+            raise HTTPException(status_code=404, detail="Artifact has expired.")
         output_dir = _HTTP_OUTPUT_ROOT / request_id
         manifest = _read_artifact_manifest(output_dir)
         artifact = manifest.get("artifacts", {}).get(artifact_name)
@@ -1741,22 +2741,18 @@ def create_app(*, serve_frontend: bool = False, include_frontend: bool | None = 
             request_id, artifact_name, disposition=disposition
         )
 
+    @app.post("/jobs", response_model=JobResponse, status_code=202, tags=["jobs"])
+    async def create_job(
+        payload: Annotated[str, Form()],
+        file: Annotated[UploadFile | None, File()] = None,
+    ) -> JobResponse:
+        job = await _create_frontend_job(payload, file=file)
+        return app.state.job_manager._job_response(job)
+
     @app.post("/translate", response_model=TranslateResponse, tags=["translation"])
     async def translate(request: TranslateRequest) -> TranslateResponse:
-        request_id = str(uuid.uuid4())
-        output_dir = _prepare_request_output_dir(request_id, request.output_dir)
-        file_path = _prepare_request_source(request, output_dir)
-        settings = _build_request_settings(
-            request,
-            file_path=file_path,
-            output_dir=output_dir,
-        )
-        return await _translate_single_file(
-            settings,
-            file_path=file_path,
-            request_id=request_id,
-            output_dir=output_dir,
-        )
+        job = await _create_request_job(request)
+        return await _wait_for_job_result(job)
 
     @app.post("/translate/file", response_model=TranslateResponse, tags=["translation"])
     async def translate_file(
@@ -1774,31 +2770,8 @@ def create_app(*, serve_frontend: bool = False, include_frontend: bool | None = 
                 details=exc.errors(),
             ) from exc
 
-        if bool(file) == bool(file_url):
-            raise APIError(
-                status_code=422,
-                code="request_validation_failed",
-                message="Provide exactly one of uploaded `file` or `file_url`.",
-            )
-
-        request_id = str(uuid.uuid4())
-        output_dir = _prepare_request_output_dir(request_id, None)
-        file_path = (
-            await _save_uploaded_pdf(file, output_dir)
-            if file
-            else _download_pdf_from_url(file_url or "", output_dir)
-        )
-        settings = _build_browser_request_settings(
-            request,
-            file_path=file_path,
-            output_dir=output_dir,
-        )
-        return await _translate_single_file(
-            settings,
-            file_path=file_path,
-            request_id=request_id,
-            output_dir=output_dir,
-        )
+        job = await _create_browser_job(request, file=file, file_url=file_url)
+        return await _wait_for_job_result(job)
 
     @app.post("/translate/file/stream", tags=["translation"])
     async def translate_file_stream(
@@ -1816,31 +2789,12 @@ def create_app(*, serve_frontend: bool = False, include_frontend: bool | None = 
                 details=exc.errors(),
             ) from exc
 
-        if bool(file) == bool(file_url):
-            raise APIError(
-                status_code=422,
-                code="request_validation_failed",
-                message="Provide exactly one of uploaded `file` or `file_url`.",
-            )
-
-        request_id = str(uuid.uuid4())
-        output_dir = _prepare_request_output_dir(request_id, None)
-        file_path = (
-            await _save_uploaded_pdf(file, output_dir)
-            if file
-            else _download_pdf_from_url(file_url or "", output_dir)
-        )
-        settings = _build_browser_request_settings(
-            request,
-            file_path=file_path,
-            output_dir=output_dir,
-        )
+        job = await _create_browser_job(request, file=file, file_url=file_url)
         return StreamingResponse(
-            _stream_translation_file(
-                settings=settings,
-                file_path=file_path,
-                request_id=request_id,
-                output_dir=output_dir,
+            _stream_job_events(
+                app.state.job_manager,
+                job.job_id,
+                legacy_format=True,
             ),
             media_type="application/x-ndjson",
         )
@@ -1850,51 +2804,21 @@ def create_app(*, serve_frontend: bool = False, include_frontend: bool | None = 
         payload: Annotated[str, Form()],
         file: Annotated[UploadFile | None, File()] = None,
     ) -> StreamingResponse:
-        if file is None:
-            raise APIError(
-                status_code=400,
-                code="missing_upload",
-                message="Upload a PDF file before starting translation.",
-            )
-        try:
-            webui_payload = _parse_webui_payload(payload)
-        except (ValidationError, WebUIError) as exc:
-            raise APIError(
-                status_code=422,
-                code="request_validation_failed",
-                message=str(exc),
-            ) from exc
-
-        request_id = str(uuid.uuid4())
-        output_dir = _prepare_request_output_dir(request_id, None)
-        file_path = await _save_uploaded_pdf(file, output_dir)
-        try:
-            _cli_settings, settings = _build_settings_from_webui(
-                _load_base_cli_settings(),
-                webui_payload,
-                file_path=file_path,
-                output_dir=output_dir,
-            )
-        except WebUIError as exc:
-            raise APIError(
-                status_code=400,
-                code="invalid_translation_settings",
-                message=str(exc),
-            ) from exc
+        job = await _create_webui_job(payload, file=file)
 
         async def legacy_stream():
             yield _coerce_json_line(
                 {
                     "type": "start",
-                    "request_id": request_id,
-                    "service": settings.translate_engine_settings.translate_engine_type,
+                    "request_id": job.request_id,
+                    "job_id": job.job_id,
+                    "service": job.service,
                 }
             )
-            async for line in _stream_translation_file(
-                settings=settings,
-                file_path=file_path,
-                request_id=request_id,
-                output_dir=output_dir,
+            async for line in _stream_job_events(
+                app.state.job_manager,
+                job.job_id,
+                legacy_format=True,
             ):
                 yield line
 
@@ -1905,40 +2829,12 @@ def create_app(*, serve_frontend: bool = False, include_frontend: bool | None = 
         payload: Annotated[str, Form()],
         file: Annotated[UploadFile | None, File()] = None,
     ) -> StreamingResponse:
-        try:
-            translate_payload = WebTranslatePayload.model_validate_json(payload)
-        except ValidationError as exc:
-            raise APIError(
-                status_code=422,
-                code="request_validation_failed",
-                message="The React translation payload is invalid.",
-                details=exc.errors(),
-            ) from exc
-
-        request_id = str(uuid.uuid4())
-        output_dir = _prepare_request_output_dir(request_id, None)
-        if translate_payload.source_type == "link":
-            file_path = _download_pdf_from_url(translate_payload.file_url or "", output_dir)
-        else:
-            if file is None:
-                raise APIError(
-                    status_code=400,
-                    code="missing_upload",
-                    message="Upload a PDF file when `source_type` is `file`.",
-                )
-            file_path = await _save_uploaded_pdf(file, output_dir)
-
-        settings = _build_web_request_settings(
-            translate_payload,
-            file_path=file_path,
-            output_dir=output_dir,
-        )
+        job = await _create_frontend_job(payload, file=file)
         return StreamingResponse(
-            _stream_translation_file(
-                settings=settings,
-                file_path=file_path,
-                request_id=request_id,
-                output_dir=output_dir,
+            _stream_job_events(
+                app.state.job_manager,
+                job.job_id,
+                legacy_format=True,
             ),
             media_type="application/x-ndjson",
         )
