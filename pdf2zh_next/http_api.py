@@ -9,6 +9,7 @@ import re
 import shutil
 import uuid
 import warnings
+from collections import Counter
 from contextlib import asynccontextmanager
 from contextlib import suppress
 from dataclasses import dataclass
@@ -166,6 +167,8 @@ class BrowserTranslateRequest(BaseModel):
     translation: dict[str, Any] = Field(default_factory=dict)
     pdf: dict[str, Any] = Field(default_factory=dict)
     engine_settings: dict[str, Any] = Field(default_factory=dict)
+    seat_id: str | None = None
+    lease_token: str | None = None
 
 
 class WebTranslatePayload(BaseModel):
@@ -173,6 +176,8 @@ class WebTranslatePayload(BaseModel):
     source_type: str = Field(default="file", description="Either `file` or `link`.")
     file_url: str | None = Field(default=None)
     persist_settings: bool = Field(default=False)
+    seat_id: str | None = None
+    lease_token: str | None = None
 
     @model_validator(mode="after")
     def validate_source(self) -> WebTranslatePayload:
@@ -265,7 +270,7 @@ class TranslateResponse(BaseModel):
 
 
 class HTTPServerSettings(BaseModel):
-    max_concurrent_jobs: int = Field(default=2, ge=1)
+    max_concurrent_jobs: int = Field(default=4, ge=1)
     max_queue_size: int = Field(default=32, ge=1)
     max_upload_size_mb: int = Field(default=100, ge=1)
     job_retention_minutes: int = Field(default=30, ge=1)
@@ -273,6 +278,72 @@ class HTTPServerSettings(BaseModel):
     metadata_retention_minutes: int = Field(default=24 * 60, ge=1)
     enable_file_url: bool = Field(default=False)
     allow_local_input_file: bool = Field(default=False)
+    seat_count: int = Field(default=4, ge=1)
+    seat_lease_timeout_seconds: int = Field(default=120, ge=30)
+    seat_heartbeat_interval_seconds: int = Field(default=25, ge=5)
+    admin_force_release_token: str | None = Field(default=None)
+
+
+class SeatManagementConfig(BaseModel):
+    enabled: bool = True
+    seat_count: int
+    lease_timeout_seconds: int
+    heartbeat_interval_seconds: int
+    admin_force_release_enabled: bool
+
+
+class SeatLoginRequest(BaseModel):
+    display_name: str
+
+
+class SeatLoginResponse(BaseModel):
+    display_name: str
+
+
+class SeatClaimRequest(BaseModel):
+    display_name: str
+
+
+class SeatLeaseRequest(BaseModel):
+    lease_token: str
+
+
+class SeatServiceRequest(BaseModel):
+    lease_token: str
+    service: str
+
+
+class SeatForceReleaseRequest(BaseModel):
+    admin_token: str
+
+
+class EngineUsageSummary(BaseModel):
+    service: str
+    active_seats: int
+
+
+class SeatSummary(BaseModel):
+    seat_id: str
+    status: Literal["available", "occupied", "stale"]
+    occupant_name: str | None = None
+    selected_service: str | None = None
+    has_active_job: bool = False
+    acquired_at: str | None = None
+    last_heartbeat_at: str | None = None
+    claimable: bool
+    message: str
+
+
+class SeatListResponse(BaseModel):
+    seats: list[SeatSummary]
+    engine_usage: list[EngineUsageSummary] = Field(default_factory=list)
+
+
+class SeatClaimResponse(BaseModel):
+    seat: SeatSummary
+    lease_token: str
+    heartbeat_interval_seconds: int
+    lease_timeout_seconds: int
 
 
 class JobError(BaseModel):
@@ -319,6 +390,464 @@ def _utc_now() -> datetime:
 
 def _dt_to_iso8601(value: datetime | None) -> str | None:
     return value.isoformat() if value else None
+
+
+def _normalize_display_name(value: str) -> str:
+    normalized = " ".join(value.split())
+    if not normalized:
+        raise APIError(
+            status_code=422,
+            code="invalid_display_name",
+            message="Enter a display name before continuing.",
+        )
+    if len(normalized) > 64:
+        raise APIError(
+            status_code=422,
+            code="invalid_display_name",
+            message="Display names must be 64 characters or fewer.",
+        )
+    return normalized
+
+
+@dataclass
+class _SeatLease:
+    seat_id: str
+    occupant_name: str | None = None
+    selected_service: str | None = None
+    lease_token: str | None = None
+    acquired_at: datetime | None = None
+    last_heartbeat_at: datetime | None = None
+    current_job_id: str | None = None
+    job_request_id: str | None = None
+
+
+class SeatManager:
+    def __init__(
+        self,
+        server_settings: HTTPServerSettings,
+        job_manager: TranslationJobManager | None = None,
+    ) -> None:
+        self.server_settings = server_settings
+        self.job_manager = job_manager
+        self._lock = asyncio.Lock()
+        self._cleanup_task: asyncio.Task | None = None
+        self._started = False
+        self._seats = {
+            str(index): _SeatLease(seat_id=str(index))
+            for index in range(1, server_settings.seat_count + 1)
+        }
+
+    async def start(self) -> None:
+        if self._started:
+            return
+        self._cleanup_task = asyncio.create_task(
+            self._cleanup_loop(),
+            name="seat-cleanup",
+        )
+        self._started = True
+
+    async def shutdown(self) -> None:
+        if not self._started:
+            return
+        if self._cleanup_task:
+            self._cleanup_task.cancel()
+            with suppress(asyncio.CancelledError, asyncio.TimeoutError):
+                await asyncio.wait_for(self._cleanup_task, timeout=2)
+        self._cleanup_task = None
+        self._started = False
+
+    def config_payload(self) -> SeatManagementConfig:
+        return SeatManagementConfig(
+            seat_count=self.server_settings.seat_count,
+            lease_timeout_seconds=self.server_settings.seat_lease_timeout_seconds,
+            heartbeat_interval_seconds=self.server_settings.seat_heartbeat_interval_seconds,
+            admin_force_release_enabled=bool(
+                self.server_settings.admin_force_release_token
+            ),
+        )
+
+    async def login(self, display_name: str) -> SeatLoginResponse:
+        return SeatLoginResponse(display_name=_normalize_display_name(display_name))
+
+    async def list_seats(self) -> SeatListResponse:
+        now = _utc_now()
+        async with self._lock:
+            return SeatListResponse(
+                seats=[
+                    self._seat_summary_unlocked(seat, now=now)
+                    for seat in self._iter_seats_unlocked()
+                ],
+                engine_usage=self._engine_usage_unlocked(now=now),
+            )
+
+    async def claim_seat(self, seat_id: str, display_name: str) -> SeatClaimResponse:
+        normalized_name = _normalize_display_name(display_name)
+        now = _utc_now()
+        async with self._lock:
+            seat = self._get_seat_unlocked(seat_id)
+            if (
+                self._seat_is_expired_unlocked(seat, now=now)
+                and not seat.current_job_id
+            ):
+                self._reset_seat_unlocked(seat)
+            if self._seat_is_claimed_unlocked(seat):
+                if self._seat_is_expired_unlocked(seat, now=now):
+                    raise APIError(
+                        status_code=409,
+                        code="seat_releasing",
+                        message=f"Seat {seat_id} is being released after a timeout.",
+                        hint="Retry in a few seconds.",
+                    )
+                raise APIError(
+                    status_code=409,
+                    code="seat_occupied",
+                    message=f"Seat {seat_id} is currently in use.",
+                    hint=(
+                        f"{seat.occupant_name} is using this seat."
+                        if seat.occupant_name
+                        else "Another user is using this seat."
+                    ),
+                )
+            for existing in self._iter_seats_unlocked():
+                if (
+                    existing.seat_id != seat_id
+                    and existing.lease_token
+                    and existing.occupant_name == normalized_name
+                ):
+                    raise APIError(
+                        status_code=409,
+                        code="display_name_already_claimed",
+                        message=(
+                            f"{normalized_name} is already using seat "
+                            f"{existing.seat_id}."
+                        ),
+                        hint="Release the current seat before claiming another one.",
+                    )
+            seat.occupant_name = normalized_name
+            seat.selected_service = None
+            seat.lease_token = uuid.uuid4().hex
+            seat.acquired_at = now
+            seat.last_heartbeat_at = now
+            seat.current_job_id = None
+            seat.job_request_id = None
+            summary = self._seat_summary_unlocked(seat, now=now)
+            lease_token = seat.lease_token
+        return SeatClaimResponse(
+            seat=summary,
+            lease_token=lease_token or "",
+            heartbeat_interval_seconds=self.server_settings.seat_heartbeat_interval_seconds,
+            lease_timeout_seconds=self.server_settings.seat_lease_timeout_seconds,
+        )
+
+    async def heartbeat(self, seat_id: str, lease_token: str) -> SeatClaimResponse:
+        now = _utc_now()
+        async with self._lock:
+            seat = self._require_active_lease_unlocked(seat_id, lease_token, now=now)
+            seat.last_heartbeat_at = now
+            summary = self._seat_summary_unlocked(seat, now=now)
+        return SeatClaimResponse(
+            seat=summary,
+            lease_token=lease_token,
+            heartbeat_interval_seconds=self.server_settings.seat_heartbeat_interval_seconds,
+            lease_timeout_seconds=self.server_settings.seat_lease_timeout_seconds,
+        )
+
+    async def release_seat(self, seat_id: str, lease_token: str) -> SeatSummary:
+        return await self._release_seat(seat_id, lease_token=lease_token)
+
+    async def update_selected_service(
+        self,
+        seat_id: str,
+        lease_token: str,
+        service_name: str,
+    ) -> SeatSummary:
+        metadata = _resolve_service_metadata(service_name)
+        async with self._lock:
+            seat = self._require_active_lease_unlocked(seat_id, lease_token)
+            seat.selected_service = metadata.translate_engine_type
+            return self._seat_summary_unlocked(seat)
+
+    async def force_release_seat(
+        self,
+        seat_id: str,
+        admin_token: str,
+    ) -> SeatSummary:
+        expected_token = self.server_settings.admin_force_release_token
+        if not expected_token:
+            raise APIError(
+                status_code=403,
+                code="feature_disabled",
+                message="Admin force release is disabled on this server.",
+            )
+        if admin_token != expected_token:
+            raise APIError(
+                status_code=403,
+                code="invalid_admin_token",
+                message="The admin token is invalid.",
+            )
+        return await self._release_seat(seat_id)
+
+    async def reserve_job(
+        self,
+        *,
+        seat_id: str,
+        lease_token: str,
+        request_id: str,
+        service_name: str,
+    ) -> None:
+        placeholder = self._pending_job_marker(request_id)
+        async with self._lock:
+            seat = self._require_active_lease_unlocked(seat_id, lease_token)
+            if seat.current_job_id:
+                raise APIError(
+                    status_code=409,
+                    code="seat_job_active",
+                    message=f"Seat {seat_id} already has an active translation job.",
+                    hint="Wait for the current job to finish or cancel it first.",
+                )
+            seat.selected_service = service_name
+            seat.current_job_id = placeholder
+            seat.job_request_id = request_id
+
+    async def bind_job(
+        self,
+        *,
+        seat_id: str,
+        lease_token: str,
+        request_id: str,
+        job_id: str,
+    ) -> None:
+        placeholder = self._pending_job_marker(request_id)
+        async with self._lock:
+            seat = self._require_active_lease_unlocked(seat_id, lease_token)
+            if seat.current_job_id != placeholder:
+                raise APIError(
+                    status_code=409,
+                    code="seat_job_reservation_missing",
+                    message="The seat reservation is no longer valid.",
+                    hint="Return to the lobby and claim the seat again.",
+                )
+            seat.current_job_id = job_id
+            seat.job_request_id = request_id
+
+    async def clear_job_reservation(
+        self,
+        *,
+        seat_id: str,
+        request_id: str,
+        lease_token: str | None = None,
+    ) -> None:
+        placeholder = self._pending_job_marker(request_id)
+        async with self._lock:
+            seat = self._seats.get(seat_id)
+            if seat is None:
+                return
+            if lease_token and seat.lease_token != lease_token:
+                return
+            if seat.current_job_id == placeholder:
+                seat.current_job_id = None
+                seat.job_request_id = None
+
+    async def clear_job(self, seat_id: str | None, job_id: str) -> None:
+        if not seat_id:
+            return
+        async with self._lock:
+            seat = self._seats.get(seat_id)
+            if seat is None:
+                return
+            if seat.current_job_id == job_id:
+                seat.current_job_id = None
+                seat.job_request_id = None
+                if self._seat_is_expired_unlocked(seat):
+                    self._reset_seat_unlocked(seat)
+
+    async def cleanup_expired_seats(self) -> None:
+        now = _utc_now()
+        expired_targets: list[tuple[str, str]] = []
+        async with self._lock:
+            for seat in self._iter_seats_unlocked():
+                if seat.lease_token and self._seat_is_expired_unlocked(seat, now=now):
+                    expired_targets.append((seat.seat_id, seat.lease_token))
+        for seat_id, lease_token in expired_targets:
+            with suppress(APIError):
+                await self._release_seat(
+                    seat_id,
+                    lease_token=lease_token,
+                    allow_expired=True,
+                )
+
+    async def _release_seat(
+        self,
+        seat_id: str,
+        *,
+        lease_token: str | None = None,
+        allow_expired: bool = False,
+    ) -> SeatSummary:
+        current_job_id: str | None = None
+        async with self._lock:
+            seat = self._get_seat_unlocked(seat_id)
+            if lease_token is not None:
+                if allow_expired:
+                    if not lease_token or seat.lease_token != lease_token:
+                        raise APIError(
+                            status_code=409,
+                            code="seat_lease_invalid",
+                            message=(
+                                "This seat is no longer assigned to the current "
+                                "browser session."
+                            ),
+                            hint=(
+                                "Return to the lobby and claim an available seat again."
+                            ),
+                        )
+                else:
+                    seat = self._require_active_lease_unlocked(seat_id, lease_token)
+            current_job_id = seat.current_job_id
+        if (
+            current_job_id
+            and not current_job_id.startswith("pending:")
+            and self.job_manager is not None
+        ):
+            with suppress(APIError):
+                await self.job_manager.cancel_job(current_job_id)
+        async with self._lock:
+            seat = self._get_seat_unlocked(seat_id)
+            if lease_token is not None and seat.lease_token != lease_token:
+                return self._seat_summary_unlocked(seat)
+            self._reset_seat_unlocked(seat)
+            return self._seat_summary_unlocked(seat)
+
+    async def _cleanup_loop(self) -> None:
+        interval = max(5, self.server_settings.seat_heartbeat_interval_seconds)
+        while True:
+            await asyncio.sleep(interval)
+            await self.cleanup_expired_seats()
+
+    def _pending_job_marker(self, request_id: str) -> str:
+        return f"pending:{request_id}"
+
+    def _iter_seats_unlocked(self) -> list[_SeatLease]:
+        return [self._seats[str(index)] for index in range(1, len(self._seats) + 1)]
+
+    def _get_seat_unlocked(self, seat_id: str) -> _SeatLease:
+        seat = self._seats.get(str(seat_id))
+        if seat is None:
+            raise APIError(
+                status_code=404,
+                code="seat_not_found",
+                message=f"Seat {seat_id} does not exist.",
+            )
+        return seat
+
+    def _seat_is_claimed_unlocked(self, seat: _SeatLease) -> bool:
+        return bool(seat.lease_token)
+
+    def _seat_is_expired_unlocked(
+        self,
+        seat: _SeatLease,
+        *,
+        now: datetime | None = None,
+    ) -> bool:
+        if not seat.lease_token or not seat.last_heartbeat_at:
+            return False
+        reference = now or _utc_now()
+        return (
+            reference - seat.last_heartbeat_at
+        ).total_seconds() >= self.server_settings.seat_lease_timeout_seconds
+
+    def _require_active_lease_unlocked(
+        self,
+        seat_id: str,
+        lease_token: str,
+        *,
+        now: datetime | None = None,
+    ) -> _SeatLease:
+        seat = self._get_seat_unlocked(seat_id)
+        if not lease_token or seat.lease_token != lease_token:
+            raise APIError(
+                status_code=409,
+                code="seat_lease_invalid",
+                message="This seat is no longer assigned to the current browser session.",
+                hint="Return to the lobby and claim an available seat again.",
+            )
+        if self._seat_is_expired_unlocked(seat, now=now):
+            raise APIError(
+                status_code=409,
+                code="seat_lease_expired",
+                message="This seat lease has expired.",
+                hint="Return to the lobby and claim an available seat again.",
+            )
+        return seat
+
+    def _reset_seat_unlocked(self, seat: _SeatLease) -> None:
+        seat.occupant_name = None
+        seat.selected_service = None
+        seat.lease_token = None
+        seat.acquired_at = None
+        seat.last_heartbeat_at = None
+        seat.current_job_id = None
+        seat.job_request_id = None
+
+    def _engine_usage_unlocked(
+        self,
+        *,
+        now: datetime | None = None,
+    ) -> list[EngineUsageSummary]:
+        usage: Counter[str] = Counter()
+        for seat in self._iter_seats_unlocked():
+            if (
+                seat.lease_token
+                and seat.selected_service
+                and not self._seat_is_expired_unlocked(seat, now=now)
+            ):
+                usage[seat.selected_service] += 1
+        return [
+            EngineUsageSummary(service=service, active_seats=active_seats)
+            for service, active_seats in sorted(
+                usage.items(),
+                key=lambda item: (-item[1], item[0].lower()),
+            )
+        ]
+
+    def _seat_summary_unlocked(
+        self,
+        seat: _SeatLease,
+        *,
+        now: datetime | None = None,
+    ) -> SeatSummary:
+        if not seat.lease_token:
+            return SeatSummary(
+                seat_id=seat.seat_id,
+                status="available",
+                selected_service=None,
+                claimable=True,
+                message="Available",
+            )
+        if self._seat_is_expired_unlocked(seat, now=now):
+            return SeatSummary(
+                seat_id=seat.seat_id,
+                status="stale",
+                occupant_name=seat.occupant_name,
+                selected_service=seat.selected_service,
+                has_active_job=bool(seat.current_job_id),
+                acquired_at=_dt_to_iso8601(seat.acquired_at),
+                last_heartbeat_at=_dt_to_iso8601(seat.last_heartbeat_at),
+                claimable=False,
+                message="Releasing after timeout",
+            )
+        return SeatSummary(
+            seat_id=seat.seat_id,
+            status="occupied",
+            occupant_name=seat.occupant_name,
+            selected_service=seat.selected_service,
+            has_active_job=bool(seat.current_job_id),
+            acquired_at=_dt_to_iso8601(seat.acquired_at),
+            last_heartbeat_at=_dt_to_iso8601(seat.last_heartbeat_at),
+            claimable=False,
+            message=(
+                f"In use by {seat.occupant_name}" if seat.occupant_name else "In use"
+            ),
+        )
 
 
 class _NonFatalBabeldocNoiseFilter(logging.Filter):
@@ -389,6 +918,7 @@ class _TranslationJob:
     output_dir: str
     file_path: Path
     settings: Any
+    seat_id: str | None = None
     status: str = "queued"
     submitted_at: datetime = field(default_factory=_utc_now)
     started_at: datetime | None = None
@@ -406,6 +936,7 @@ class _TranslationJob:
 class TranslationJobManager:
     def __init__(self, server_settings: HTTPServerSettings) -> None:
         self.server_settings = server_settings
+        self.seat_manager: SeatManager | None = None
         self._jobs: dict[str, _TranslationJob] = {}
         self._request_to_job_id: dict[str, str] = {}
         self._queue: asyncio.Queue[str] = asyncio.Queue()
@@ -427,7 +958,9 @@ class TranslationJobManager:
             return
         _HTTP_OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
         self._workers = [
-            asyncio.create_task(self._worker_loop(index), name=f"translation-worker-{index}")
+            asyncio.create_task(
+                self._worker_loop(index), name=f"translation-worker-{index}"
+            )
             for index in range(self.server_settings.max_concurrent_jobs)
         ]
         self._cleanup_task = asyncio.create_task(
@@ -464,6 +997,7 @@ class TranslationJobManager:
         file_path: Path,
         output_dir: Path,
         settings: Any,
+        seat_id: str | None = None,
     ) -> _TranslationJob:
         async with self._lock:
             if len(self._queued_job_ids) >= self.server_settings.max_queue_size:
@@ -481,6 +1015,7 @@ class TranslationJobManager:
                 output_dir=str(output_dir),
                 file_path=file_path,
                 settings=settings,
+                seat_id=seat_id,
             )
             self._jobs[job.job_id] = job
             self._request_to_job_id[job.request_id] = job.job_id
@@ -543,6 +1078,7 @@ class TranslationJobManager:
                 event = None
         if event:
             await self._publish(job, event)
+            await self._clear_job_seat(job)
         return job
 
     async def subscribe(self, job_id: str) -> tuple[_TranslationJob, asyncio.Queue]:
@@ -578,6 +1114,11 @@ class TranslationJobManager:
             **self.health_payload(),
         }
 
+    async def _clear_job_seat(self, job: _TranslationJob) -> None:
+        if self.seat_manager is None or not job.seat_id:
+            return
+        await self.seat_manager.clear_job(job.seat_id, job.job_id)
+
     async def cleanup_expired_jobs(self) -> None:
         now = _utc_now()
         expiration_targets: list[_TranslationJob] = []
@@ -594,11 +1135,8 @@ class TranslationJobManager:
                     and job.status in {"succeeded", "failed", "cancelled"}
                 ):
                     expiration_targets.append(job)
-                if (
-                    job.finished_at
-                    and now
-                    >= job.finished_at
-                    + timedelta(minutes=self.server_settings.metadata_retention_minutes)
+                if job.finished_at and now >= job.finished_at + timedelta(
+                    minutes=self.server_settings.metadata_retention_minutes
                 ):
                     purge_targets.append(job.job_id)
         for job in expiration_targets:
@@ -720,6 +1258,7 @@ class TranslationJobManager:
                         self._metrics["failed"] += 1
                         job.done_event.set()
                     await self._publish(job, self._event_payload(job, "error"))
+                    await self._clear_job_seat(job)
                     return
                 if event_type == "finish":
                     response = _build_translate_response(
@@ -740,6 +1279,7 @@ class TranslationJobManager:
                         self._metrics["succeeded"] += 1
                         job.done_event.set()
                     await self._publish(job, self._event_payload(job, "finish"))
+                    await self._clear_job_seat(job)
                     return
             async with self._lock:
                 job.status = "failed"
@@ -754,6 +1294,7 @@ class TranslationJobManager:
                 self._metrics["failed"] += 1
                 job.done_event.set()
             await self._publish(job, self._event_payload(job, "error"))
+            await self._clear_job_seat(job)
         except asyncio.CancelledError:
             async with self._lock:
                 job.status = "cancelled"
@@ -764,6 +1305,7 @@ class TranslationJobManager:
                 self._metrics["cancelled"] += 1
                 job.done_event.set()
             await self._publish(job, self._event_payload(job, "cancelled"))
+            await self._clear_job_seat(job)
         except Exception as exc:
             logger.exception("Job %s failed unexpectedly: %s", job.job_id, exc)
             async with self._lock:
@@ -780,6 +1322,7 @@ class TranslationJobManager:
                 self._metrics["failed"] += 1
                 job.done_event.set()
             await self._publish(job, self._event_payload(job, "error"))
+            await self._clear_job_seat(job)
 
     async def _publish(self, job: _TranslationJob, event: dict[str, Any]) -> None:
         async with self._lock:
@@ -861,6 +1404,7 @@ def _api_root_payload() -> dict[str, Any]:
         "translate": "/translate",
         "app": "/app",
         "app_config": "/app/config",
+        "seats": "/seats",
         "ui_config": "/api/ui-config",
         "save_config": "/api/config",
         "upload_translate": "/translate/file",
@@ -882,7 +1426,9 @@ def _build_settings_hint(message: str) -> str | None:
     if "error parsing pages parameter" in searchable_message:
         return "Use `pages` like `1,3,5-7`."
     if "cannot disable both dual and mono" in searchable_message:
-        return "Leave at least one output enabled by keeping `no_mono` or `no_dual` false."
+        return (
+            "Leave at least one output enabled by keeping `no_mono` or `no_dual` false."
+        )
     if "file does not exist" in searchable_message:
         return "Pass an existing PDF path in `input_file`."
     return None
@@ -891,9 +1437,7 @@ def _build_settings_hint(message: str) -> str | None:
 def _build_translation_hint(message: str) -> str | None:
     searchable_message = message.lower()
     if any(token in searchable_message for token in ("api key", "credential", "auth")):
-        return (
-            "Check the configured translation engine credentials, then retry the request."
-        )
+        return "Check the configured translation engine credentials, then retry the request."
     if any(
         token in searchable_message
         for token in ("timeout", "timed out", "connection reset", "network")
@@ -927,7 +1471,9 @@ def _build_full_cli_settings(settings_payload: dict[str, Any]) -> CLIEnvSettings
     cleaned_payload = drop_empty_sensitive_values(settings_payload)
     merged_settings = config_manager.merge_settings([cleaned_payload, base_settings])
     try:
-        return config_manager._build_model_from_args(CLIEnvSettingsModel, merged_settings)
+        return config_manager._build_model_from_args(
+            CLIEnvSettingsModel, merged_settings
+        )
     except ValidationError as exc:
         raise APIError(
             status_code=422,
@@ -1197,9 +1743,7 @@ def _build_field_schema(model_type: type[BaseModel], field_name: str) -> dict[st
     if localized_choices:
         field_type = "select"
     if field_type == "select" and not localized_choices:
-        raise ValueError(
-            f"Missing localized WebUI choices for field `{field_name}`."
-        )
+        raise ValueError(f"Missing localized WebUI choices for field `{field_name}`.")
     localized_choices = localized_choices or choices or []
     default_value = None
     if model_field.default_factory is not None:
@@ -1232,8 +1776,11 @@ def _build_model_schema(
     ]
 
 
-def _build_app_config() -> dict[str, Any]:
+def _build_app_config(
+    server_settings: HTTPServerSettings | None = None,
+) -> dict[str, Any]:
     cli_settings = _load_base_cli_settings()
+    server_settings = server_settings or HTTPServerSettings()
     services = []
     for metadata in TRANSLATION_ENGINE_METADATA:
         services.append(
@@ -1253,6 +1800,12 @@ def _build_app_config() -> dict[str, Any]:
         "version": __version__,
         "default_service": "SiliconFlowFree",
         "default_locale": normalize_ui_locale(cli_settings.gui_settings.ui_lang),
+        "seat_management": SeatManagementConfig(
+            seat_count=server_settings.seat_count,
+            lease_timeout_seconds=server_settings.seat_lease_timeout_seconds,
+            heartbeat_interval_seconds=server_settings.seat_heartbeat_interval_seconds,
+            admin_force_release_enabled=bool(server_settings.admin_force_release_token),
+        ).model_dump(mode="json"),
         "services": services,
         "translation_languages": build_translation_language_options(),
         "translation_fields": _build_model_schema(
@@ -1408,7 +1961,8 @@ def _build_ui_bootstrap() -> dict[str, Any]:
             "custom_system_prompt": cli_settings.translation.custom_system_prompt or "",
             "save_auto_extracted_glossary": cli_settings.translation.save_auto_extracted_glossary,
             "enable_auto_term_extraction": auto_term_extraction_enabled,
-            "primary_font_family": cli_settings.translation.primary_font_family or "Auto",
+            "primary_font_family": cli_settings.translation.primary_font_family
+            or "Auto",
             "skip_clean": cli_settings.pdf.skip_clean,
             "disable_rich_text_translate": cli_settings.pdf.disable_rich_text_translate,
             "enhance_compatibility": cli_settings.pdf.enhance_compatibility,
@@ -1428,7 +1982,9 @@ def _build_ui_bootstrap() -> dict[str, Any]:
             "figure_table_protection_threshold": cli_settings.pdf.figure_table_protection_threshold,
             "skip_formula_offset_calculation": cli_settings.pdf.skip_formula_offset_calculation,
             "term_service": TERM_SERVICE_FOLLOW_MAIN,
-            "term_qps": cli_settings.translation.term_qps or cli_settings.translation.qps or 4,
+            "term_qps": cli_settings.translation.term_qps
+            or cli_settings.translation.qps
+            or 4,
             "term_pool_max_workers": cli_settings.translation.term_pool_max_workers,
             "service_config": _build_bootstrap_service_config(cli_settings, service),
             "term_service_config": {},
@@ -1572,7 +2128,9 @@ def _build_settings_from_webui(
     if payload.service not in TRANSLATION_ENGINE_METADATA_MAP:
         raise WebUIError(f"Unsupported translation service: {payload.service}")
     if payload.no_mono and payload.no_dual:
-        raise WebUIError("Select at least one output format before starting translation.")
+        raise WebUIError(
+            "Select at least one output format before starting translation."
+        )
 
     pages_map = {"all": None, "first": "1", "first5": "1,2,3,4,5", "range": None}
     pages = pages_map[payload.page_mode]
@@ -1743,7 +2301,9 @@ def _set_translation_service(
     )
 
 
-def _apply_overrides(section: Any, overrides: dict[str, Any], *, section_name: str) -> None:
+def _apply_overrides(
+    section: Any, overrides: dict[str, Any], *, section_name: str
+) -> None:
     model_fields = type(section).model_fields
     for field_name, value in overrides.items():
         if field_name not in model_fields:
@@ -1987,7 +2547,9 @@ def _write_artifact_manifest(
                 ),
                 "filename": artifact.filename,
                 "content_type": _guess_content_type(
-                    input_file_path if name == _SOURCE_ARTIFACT_NAME else Path(artifact.filename)
+                    input_file_path
+                    if name == _SOURCE_ARTIFACT_NAME
+                    else Path(artifact.filename)
                 ),
             }
             for name, artifact in response.artifacts.items()
@@ -2060,9 +2622,7 @@ def _build_translate_response(
         preview_url=(
             artifacts.get("mono").preview_url
             if "mono" in artifacts
-            else (
-                artifacts.get("dual").preview_url if "dual" in artifacts else None
-            )
+            else (artifacts.get("dual").preview_url if "dual" in artifacts else None)
         ),
         total_seconds=getattr(result, "total_seconds", None),
         token_usage=token_usage or {},
@@ -2133,25 +2693,72 @@ def _coerce_json_line(data: dict[str, Any]) -> bytes:
     return (json.dumps(data, ensure_ascii=False) + "\n").encode("utf-8")
 
 
+def _require_browser_seat(
+    *,
+    seat_id: str | None,
+    lease_token: str | None,
+) -> tuple[str, str]:
+    if not seat_id or not lease_token:
+        raise APIError(
+            status_code=409,
+            code="seat_required",
+            message="Claim an available seat before starting a translation.",
+            hint="Return to the lobby and enter one of the four seats first.",
+        )
+    return seat_id, lease_token
+
+
 async def _submit_translation_job(
     *,
     job_manager: TranslationJobManager,
+    seat_manager: SeatManager | None,
     settings: Any,
     file_path: Path,
     request_id: str,
     output_dir: Path,
+    seat_id: str | None = None,
+    lease_token: str | None = None,
 ) -> _TranslationJob:
     capped_settings = _apply_server_resource_caps(
         settings,
         job_manager.server_settings,
     )
-    job = await job_manager.submit_job(
-        request_id=request_id,
-        service=capped_settings.translate_engine_settings.translate_engine_type,
-        file_path=file_path,
-        output_dir=output_dir,
-        settings=capped_settings,
-    )
+    if seat_manager and seat_id and lease_token:
+        await seat_manager.reserve_job(
+            seat_id=seat_id,
+            lease_token=lease_token,
+            request_id=request_id,
+            service_name=capped_settings.translate_engine_settings.translate_engine_type,
+        )
+    try:
+        job = await job_manager.submit_job(
+            request_id=request_id,
+            service=capped_settings.translate_engine_settings.translate_engine_type,
+            file_path=file_path,
+            output_dir=output_dir,
+            settings=capped_settings,
+            seat_id=seat_id,
+        )
+    except Exception:
+        if seat_manager and seat_id:
+            await seat_manager.clear_job_reservation(
+                seat_id=seat_id,
+                request_id=request_id,
+                lease_token=lease_token,
+            )
+        raise
+    if seat_manager and seat_id and lease_token:
+        try:
+            await seat_manager.bind_job(
+                seat_id=seat_id,
+                lease_token=lease_token,
+                request_id=request_id,
+                job_id=job.job_id,
+            )
+        except Exception:
+            with suppress(APIError):
+                await job_manager.cancel_job(job.job_id)
+            raise
     logger.info(
         "Accepted translation job %s for request %s using service=%s auto_term_extraction=%s.",
         job.job_id,
@@ -2179,9 +2786,7 @@ def _raise_for_terminal_job(job: _TranslationJob) -> TranslateResponse:
         )
     if job.error:
         raise APIError(
-            status_code=502
-            if job.error.get("code") == "translation_failed"
-            else 500,
+            status_code=502 if job.error.get("code") == "translation_failed" else 500,
             code=job.error.get("code", "internal_error"),
             message=job.error.get("message", "Translation failed."),
             hint=job.error.get("hint"),
@@ -2365,13 +2970,17 @@ def create_app(
     server_settings = server_settings or HTTPServerSettings()
     _configure_runtime_noise_filters()
     job_manager = TranslationJobManager(server_settings)
+    seat_manager = SeatManager(server_settings, job_manager=job_manager)
+    job_manager.seat_manager = seat_manager
 
     @asynccontextmanager
-    async def lifespan(app: FastAPI):
+    async def lifespan(_app: FastAPI):
         await job_manager.start()
+        await seat_manager.start()
         try:
             yield
         finally:
+            await seat_manager.shutdown()
             await job_manager.shutdown()
 
     app = FastAPI(
@@ -2392,6 +3001,7 @@ def create_app(
     )
     app.state.server_settings = server_settings
     app.state.job_manager = job_manager
+    app.state.seat_manager = seat_manager
 
     @app.exception_handler(APIError)
     async def api_error_handler(
@@ -2481,7 +3091,77 @@ def create_app(
 
     @app.get("/app/config", tags=["meta"])
     async def app_config() -> dict[str, Any]:
-        return _build_app_config()
+        return _build_app_config(app.state.server_settings)
+
+    @app.post("/seats/login", response_model=SeatLoginResponse, tags=["seats"])
+    async def seat_login(payload: SeatLoginRequest) -> SeatLoginResponse:
+        return await app.state.seat_manager.login(payload.display_name)
+
+    @app.get("/seats", response_model=SeatListResponse, tags=["seats"])
+    async def list_seats() -> SeatListResponse:
+        return await app.state.seat_manager.list_seats()
+
+    @app.post(
+        "/seats/{seat_id}/claim",
+        response_model=SeatClaimResponse,
+        tags=["seats"],
+    )
+    async def claim_seat(
+        seat_id: str,
+        payload: SeatClaimRequest,
+    ) -> SeatClaimResponse:
+        return await app.state.seat_manager.claim_seat(seat_id, payload.display_name)
+
+    @app.post(
+        "/seats/{seat_id}/heartbeat",
+        response_model=SeatClaimResponse,
+        tags=["seats"],
+    )
+    async def heartbeat_seat(
+        seat_id: str,
+        payload: SeatLeaseRequest,
+    ) -> SeatClaimResponse:
+        return await app.state.seat_manager.heartbeat(seat_id, payload.lease_token)
+
+    @app.post(
+        "/seats/{seat_id}/release",
+        response_model=SeatSummary,
+        tags=["seats"],
+    )
+    async def release_seat(
+        seat_id: str,
+        payload: SeatLeaseRequest,
+    ) -> SeatSummary:
+        return await app.state.seat_manager.release_seat(seat_id, payload.lease_token)
+
+    @app.post(
+        "/seats/{seat_id}/service",
+        response_model=SeatSummary,
+        tags=["seats"],
+    )
+    async def update_seat_service(
+        seat_id: str,
+        payload: SeatServiceRequest,
+    ) -> SeatSummary:
+        return await app.state.seat_manager.update_selected_service(
+            seat_id,
+            payload.lease_token,
+            payload.service,
+        )
+
+    @app.post(
+        "/admin/seats/{seat_id}/force-release",
+        response_model=SeatSummary,
+        tags=["seats"],
+    )
+    async def force_release_seat(
+        seat_id: str,
+        payload: SeatForceReleaseRequest,
+    ) -> SeatSummary:
+        return await app.state.seat_manager.force_release_seat(
+            seat_id,
+            payload.admin_token,
+        )
 
     @app.get("/ui/bootstrap", tags=["meta"])
     async def ui_bootstrap() -> dict[str, Any]:
@@ -2524,10 +3204,7 @@ def create_app(
     async def list_jobs(limit: int = 50) -> JobListResponse:
         jobs = await app.state.job_manager.list_jobs(limit=limit)
         return JobListResponse(
-            jobs=[
-                app.state.job_manager._job_response(job)
-                for job in jobs
-            ]
+            jobs=[app.state.job_manager._job_response(job) for job in jobs]
         )
 
     @app.get("/jobs/{job_id}", response_model=JobResponse, tags=["jobs"])
@@ -2564,6 +3241,7 @@ def create_app(
         )
         return await _submit_translation_job(
             job_manager=app.state.job_manager,
+            seat_manager=None,
             settings=settings,
             file_path=file_path,
             request_id=request_id,
@@ -2582,6 +3260,10 @@ def create_app(
                 code="request_validation_failed",
                 message="Provide exactly one of uploaded `file` or `file_url`.",
             )
+        seat_id, lease_token = _require_browser_seat(
+            seat_id=request.seat_id,
+            lease_token=request.lease_token,
+        )
         request_id = str(uuid.uuid4())
         output_dir = _prepare_request_output_dir(request_id, None)
         file_path = (
@@ -2596,10 +3278,13 @@ def create_app(
         )
         return await _submit_translation_job(
             job_manager=app.state.job_manager,
+            seat_manager=app.state.seat_manager,
             settings=settings,
             file_path=file_path,
             request_id=request_id,
             output_dir=output_dir,
+            seat_id=seat_id,
+            lease_token=lease_token,
         )
 
     async def _create_webui_job(
@@ -2639,6 +3324,7 @@ def create_app(
             ) from exc
         return await _submit_translation_job(
             job_manager=app.state.job_manager,
+            seat_manager=None,
             settings=settings,
             file_path=file_path,
             request_id=request_id,
@@ -2659,6 +3345,10 @@ def create_app(
                 message="The React translation payload is invalid.",
                 details=exc.errors(),
             ) from exc
+        seat_id, lease_token = _require_browser_seat(
+            seat_id=translate_payload.seat_id,
+            lease_token=translate_payload.lease_token,
+        )
         request_id = str(uuid.uuid4())
         output_dir = _prepare_request_output_dir(request_id, None)
         if translate_payload.source_type == "link":
@@ -2682,10 +3372,13 @@ def create_app(
         )
         return await _submit_translation_job(
             job_manager=app.state.job_manager,
+            seat_manager=app.state.seat_manager,
             settings=settings,
             file_path=file_path,
             request_id=request_id,
             output_dir=output_dir,
+            seat_id=seat_id,
+            lease_token=lease_token,
         )
 
     async def _download_artifact_impl(

@@ -10,7 +10,9 @@ interface SettingsSectionProps {
   description?: string;
   fields: ConfigField[];
   locale: UiLocale;
+  emptyTitle?: string;
   emptyMessage?: string;
+  emptyHint?: string;
   fieldLabels: {
     leaveBlank: string;
     required: string;
@@ -27,18 +29,25 @@ export function SettingsSection({
   description,
   fields,
   locale,
+  emptyTitle,
   emptyMessage,
+  emptyHint,
   fieldLabels,
   values,
   onChange,
 }: SettingsSectionProps): ReactElement {
-  void eyebrow;
-  void description;
+  const resolvedEmptyTitle = emptyTitle ?? title;
+  const resolvedEmptyMessage = emptyMessage ?? description;
 
   if (!fields.length) {
     return (
-      <section className="settings-card" aria-label={title}>
-        {emptyMessage ? <p className="section-copy">{emptyMessage}</p> : null}
+      <section className="settings-card settings-card-empty" aria-label={title}>
+        <div className="settings-empty-state">
+          <span className="section-eyebrow">{eyebrow}</span>
+          <strong>{resolvedEmptyTitle}</strong>
+          {resolvedEmptyMessage ? <p className="section-copy">{resolvedEmptyMessage}</p> : null}
+          {emptyHint ? <p className="field-hint">{emptyHint}</p> : null}
+        </div>
       </section>
     );
   }

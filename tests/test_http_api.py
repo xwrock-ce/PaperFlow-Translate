@@ -3,9 +3,11 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import secrets
 import time
 import warnings
 from contextlib import suppress
+from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -59,6 +61,10 @@ def _base_openai_settings() -> CLIEnvSettingsModel:
 
 
 def _job_payload() -> str:
+    return _job_payload_with_seat("1", "test-token")
+
+
+def _job_payload_with_seat(seat_id: str, lease_token: str) -> str:
     return json.dumps(
         {
             "settings": {
@@ -66,6 +72,8 @@ def _job_payload() -> str:
                 "openai_detail": {"openai_api_key": "test-key"},
             },
             "source_type": "file",
+            "seat_id": seat_id,
+            "lease_token": lease_token,
         }
     )
 
@@ -90,6 +98,36 @@ def _build_frontend_default_payload(app_config: dict, *, service_name: str) -> d
         "pdf": build_values(app_config["pdf_fields"]),
         "engine_settings": build_values(service["fields"]),
     }
+
+
+def _claim_seat(
+    client: TestClient,
+    *,
+    seat_id: str = "1",
+    display_name: str = "Alice",
+) -> tuple[str, str]:
+    login = client.post("/seats/login", json={"display_name": display_name})
+    assert login.status_code == 200
+    claim = client.post(
+        f"/seats/{seat_id}/claim",
+        json={"display_name": login.json()["display_name"]},
+    )
+    assert claim.status_code == 200
+    return claim.json()["seat"]["seat_id"], claim.json()["lease_token"]
+
+
+def _set_seat_service(
+    client: TestClient,
+    seat_id: str,
+    lease_token: str,
+    service: str,
+):
+    response = client.post(
+        f"/seats/{seat_id}/service",
+        json={"lease_token": lease_token, "service": service},
+    )
+    assert response.status_code == 200
+    return response.json()
 
 
 def test_create_app_lifespan_starts_and_stops_job_manager():
@@ -144,6 +182,8 @@ def test_app_config_returns_frontend_form_schema():
     payload = response.json()
     assert payload["default_service"] == "SiliconFlowFree"
     assert payload["default_locale"] == "en"
+    assert payload["seat_management"]["seat_count"] == 4
+    assert payload["seat_management"]["lease_timeout_seconds"] == 120
     assert any(service["name"] == "OpenAI" for service in payload["services"])
     ignore_cache = next(
         field
@@ -168,6 +208,149 @@ def test_app_config_returns_frontend_form_schema():
     assert english["label"]["en"] == "English"
     assert english["label"]["zh"] == "英语"
     assert simplified_chinese["label"]["zh"] == "简体中文"
+
+
+def test_seat_claim_heartbeat_and_force_release():
+    admin_token = secrets.token_urlsafe(12)
+    client = _client(
+        server_settings=HTTPServerSettings(admin_force_release_token=admin_token)  # noqa: S106
+    )
+
+    seat_id, lease_token = _claim_seat(client, seat_id="1", display_name="Alice")
+
+    seats = client.get("/seats")
+    assert seats.status_code == 200
+    seat_payload = next(
+        seat for seat in seats.json()["seats"] if seat["seat_id"] == seat_id
+    )
+    assert seat_payload["status"] == "occupied"
+    assert seat_payload["occupant_name"] == "Alice"
+    assert seat_payload["selected_service"] is None
+    assert seats.json()["engine_usage"] == []
+
+    occupied = client.post("/seats/1/claim", json={"display_name": "Bob"})
+    assert occupied.status_code == 409
+    assert occupied.json()["error"]["code"] == "seat_occupied"
+
+    heartbeat = client.post(
+        f"/seats/{seat_id}/heartbeat",
+        json={"lease_token": lease_token},
+    )
+    assert heartbeat.status_code == 200
+    assert heartbeat.json()["seat"]["seat_id"] == seat_id
+
+    wrong_admin = client.post(
+        "/admin/seats/1/force-release",
+        json={"admin_token": "wrong"},
+    )
+    assert wrong_admin.status_code == 403
+
+    released = client.post(
+        "/admin/seats/1/force-release",
+        json={"admin_token": admin_token},
+    )
+    assert released.status_code == 200
+    assert released.json()["status"] == "available"
+    assert released.json()["selected_service"] is None
+
+
+def test_seat_service_selection_is_visible_and_cleared_on_release():
+    client = _client()
+    seat_id, lease_token = _claim_seat(client, seat_id="1", display_name="Alice")
+
+    updated = _set_seat_service(client, seat_id, lease_token, "OpenAI")
+    assert updated["selected_service"] == "OpenAI"
+
+    seats = client.get("/seats")
+    assert seats.status_code == 200
+    seat_payload = next(
+        seat for seat in seats.json()["seats"] if seat["seat_id"] == seat_id
+    )
+    assert seat_payload["selected_service"] == "OpenAI"
+    assert seats.json()["engine_usage"] == [{"service": "OpenAI", "active_seats": 1}]
+
+    released = client.post(
+        f"/seats/{seat_id}/release",
+        json={"lease_token": lease_token},
+    )
+    assert released.status_code == 200
+    assert released.json()["selected_service"] is None
+
+    seats_after_release = client.get("/seats")
+    assert seats_after_release.status_code == 200
+    released_payload = next(
+        seat
+        for seat in seats_after_release.json()["seats"]
+        if seat["seat_id"] == seat_id
+    )
+    assert released_payload["status"] == "available"
+    assert released_payload["selected_service"] is None
+    assert seats_after_release.json()["engine_usage"] == []
+
+
+def test_seat_engine_usage_counts_multiple_active_seats():
+    client = _client()
+    first_seat_id, first_lease_token = _claim_seat(
+        client, seat_id="1", display_name="Alice"
+    )
+    second_seat_id, second_lease_token = _claim_seat(
+        client, seat_id="2", display_name="Bob"
+    )
+    third_seat_id, third_lease_token = _claim_seat(
+        client, seat_id="3", display_name="Carol"
+    )
+
+    _set_seat_service(client, first_seat_id, first_lease_token, "OpenAI")
+    _set_seat_service(client, second_seat_id, second_lease_token, "OpenAI")
+    _set_seat_service(client, third_seat_id, third_lease_token, "Google")
+
+    seats = client.get("/seats")
+    assert seats.status_code == 200
+    assert seats.json()["engine_usage"] == [
+        {"service": "OpenAI", "active_seats": 2},
+        {"service": "Google", "active_seats": 1},
+    ]
+
+
+def test_stream_translate_requires_seat_claim(monkeypatch):
+    monkeypatch.setattr(
+        "pdf2zh_next.http_api._load_base_cli_settings",
+        _base_openai_settings,
+    )
+
+    response = _client().post(
+        "/translate/file/stream",
+        data={
+            "request_json": json.dumps(
+                {
+                    "service": "OpenAI",
+                    "lang_in": "en",
+                    "lang_out": "zh",
+                    "translation": {},
+                    "pdf": {},
+                    "engine_settings": {"openai_api_key": "test-key"},
+                }
+            )
+        },
+        files={"file": ("paper.pdf", b"%PDF-1.4\n", "application/pdf")},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "seat_required"
+
+
+def test_expired_seat_is_released_by_cleanup():
+    client = _client()
+    seat_id, _lease_token = _claim_seat(client, seat_id="1", display_name="Alice")
+
+    seat = client.app.state.seat_manager._seats[seat_id]
+    seat.last_heartbeat_at = seat.last_heartbeat_at - timedelta(seconds=121)
+
+    client.portal.call(client.app.state.seat_manager.cleanup_expired_seats)
+
+    seats = client.get("/seats").json()["seats"]
+    released = next(item for item in seats if item["seat_id"] == seat_id)
+    assert released["status"] == "available"
 
 
 def test_translation_language_labels_fall_back_when_langcodes_returns_blank(
@@ -369,9 +552,7 @@ def test_translate_returns_structured_success(monkeypatch, tmp_path):
     assert payload["token_usage"]["main"]["total"] == 12
     assert payload["mono_download_url"].startswith("/requests/")
     assert payload["artifacts"]["mono"]["url"] == payload["mono_download_url"]
-    assert payload["artifacts"]["mono"]["preview_url"].endswith(
-        "?disposition=inline"
-    )
+    assert payload["artifacts"]["mono"]["preview_url"].endswith("?disposition=inline")
     assert payload["preview_url"] == payload["artifacts"]["mono"]["preview_url"]
 
 
@@ -485,12 +666,17 @@ def test_stream_translate_upload_returns_progress_and_finish(monkeypatch, tmp_pa
         fake_translate_stream,
     )
 
-    response = _client().post(
+    client = _client()
+    seat_id, lease_token = _claim_seat(client)
+
+    response = client.post(
         "/translate/file/stream",
         data={
             "request_json": json.dumps(
                 {
                     "service": "OpenAI",
+                    "seat_id": seat_id,
+                    "lease_token": lease_token,
                     "lang_in": "en",
                     "lang_out": "zh",
                     "translation": {},
@@ -515,13 +701,20 @@ def test_stream_translate_upload_returns_progress_and_finish(monkeypatch, tmp_pa
         "?disposition=inline"
     )
 
+    seats = client.get("/seats")
+    assert seats.status_code == 200
+    seat_payload = next(
+        seat for seat in seats.json()["seats"] if seat["seat_id"] == seat_id
+    )
+    assert seat_payload["selected_service"] == "OpenAI"
+
 
 def test_google_translator_uses_request_timeout_and_reraises_timeout(monkeypatch):
     settings = CLIEnvSettingsModel(google=True).to_settings_model()
     translator = GoogleTranslator(settings, Mock())
     calls = []
 
-    def fake_get(*args, **kwargs):
+    def fake_get(*_args, **kwargs):
         calls.append(kwargs)
         raise requests.Timeout("network timeout")
 
@@ -569,6 +762,7 @@ def test_stream_translate_accepts_frontend_default_blank_optionals(
     )
 
     client = _client()
+    seat_id, lease_token = _claim_seat(client)
     app_config = client.get("/app/config").json()
     payload = _build_frontend_default_payload(app_config, service_name="OpenAI")
     payload["engine_settings"]["openai_api_key"] = "test-key"
@@ -579,6 +773,8 @@ def test_stream_translate_accepts_frontend_default_blank_optionals(
             "request_json": json.dumps(
                 {
                     "service": "OpenAI",
+                    "seat_id": seat_id,
+                    "lease_token": lease_token,
                     "lang_in": "en",
                     "lang_out": "zh",
                     "translation": payload["translation"],
@@ -633,13 +829,18 @@ def test_stream_translate_non_llm_service_disables_auto_term_extraction_and_logs
         fake_translate_stream,
     )
 
+    client = _client()
+    seat_id, lease_token = _claim_seat(client)
+
     with caplog.at_level(logging.INFO):
-        response = _client().post(
+        response = client.post(
             "/translate/file/stream",
             data={
                 "request_json": json.dumps(
                     {
                         "service": "Google",
+                        "seat_id": seat_id,
+                        "lease_token": lease_token,
                         "lang_in": "en",
                         "lang_out": "zh",
                         "translation": {},
@@ -779,9 +980,10 @@ def test_jobs_endpoint_returns_status_and_result(monkeypatch, tmp_path):
 
     client = _client()
     try:
+        seat_id, lease_token = _claim_seat(client)
         response = client.post(
             "/jobs",
-            data={"payload": _job_payload()},
+            data={"payload": _job_payload_with_seat(seat_id, lease_token)},
             files={"file": ("paper.pdf", b"%PDF-1.4\n", "application/pdf")},
         )
 
@@ -850,9 +1052,10 @@ def test_jobs_queue_full(monkeypatch):
     )
     client = _client(server_settings=settings)
     try:
+        first_seat_id, first_lease_token = _claim_seat(client, seat_id="1")
         first = client.post(
             "/jobs",
-            data={"payload": _job_payload()},
+            data={"payload": _job_payload_with_seat(first_seat_id, first_lease_token)},
             files={"file": ("paper1.pdf", b"%PDF-1.4\n", "application/pdf")},
         )
         assert first.status_code == 202
@@ -866,18 +1069,30 @@ def test_jobs_queue_full(monkeypatch):
         else:
             raise AssertionError("first job did not start")
 
+        second_seat_id, second_lease_token = _claim_seat(
+            client,
+            seat_id="2",
+            display_name="Bob",
+        )
         second = client.post(
             "/jobs",
-            data={"payload": _job_payload()},
+            data={
+                "payload": _job_payload_with_seat(second_seat_id, second_lease_token)
+            },
             files={"file": ("paper2.pdf", b"%PDF-1.4\n", "application/pdf")},
         )
         assert second.status_code == 202
         assert second.json()["status"] == "queued"
         second_job_id = second.json()["job_id"]
 
+        third_seat_id, third_lease_token = _claim_seat(
+            client,
+            seat_id="3",
+            display_name="Carol",
+        )
         third = client.post(
             "/jobs",
-            data={"payload": _job_payload()},
+            data={"payload": _job_payload_with_seat(third_seat_id, third_lease_token)},
             files={"file": ("paper3.pdf", b"%PDF-1.4\n", "application/pdf")},
         )
         assert third.status_code == 429
@@ -918,9 +1133,10 @@ def test_cleanup_expires_job_artifacts(monkeypatch, tmp_path):
 
     client = _client()
     try:
+        seat_id, lease_token = _claim_seat(client)
         response = client.post(
             "/jobs",
-            data={"payload": _job_payload()},
+            data={"payload": _job_payload_with_seat(seat_id, lease_token)},
             files={"file": ("paper.pdf", b"%PDF-1.4\n", "application/pdf")},
         )
         assert response.status_code == 202
@@ -975,7 +1191,9 @@ def test_runtime_noise_filter_downgrades_known_babeldoc_font_parse_error(caplog)
     assert matching_record.levelno == logging.WARNING
 
     other_record = next(
-        record for record in caplog.records if record.getMessage() == "different babeldoc error"
+        record
+        for record in caplog.records
+        if record.getMessage() == "different babeldoc error"
     )
     assert other_record.levelno == logging.ERROR
 

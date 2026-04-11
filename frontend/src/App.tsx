@@ -10,7 +10,19 @@ import {
 
 import { PreviewPanel } from "./components/PreviewPanel";
 import { SettingsSection } from "./components/SettingsSection";
-import { fetchAppConfig, streamTranslation } from "./lib/api";
+import {
+  ApiError,
+  cancelJob,
+  claimSeat,
+  fetchAppConfig,
+  fetchSeats,
+  forceReleaseSeat,
+  heartbeatSeat,
+  loginSeat,
+  releaseSeat,
+  streamTranslation,
+  updateSeatService,
+} from "./lib/api";
 import {
   artifactLabel,
   pickText,
@@ -21,7 +33,10 @@ import {
 import type {
   AppConfig,
   ConfigField,
+  EngineUsageSummary,
   PreviewArtifactName,
+  SeatSession,
+  SeatSummary,
   ServiceConfig,
   SourceMode,
   TranslationResult,
@@ -66,6 +81,225 @@ interface DownloadOption {
   url: string;
   filename: string;
   meta: string;
+}
+
+interface SeatInventory {
+  seats: SeatSummary[];
+  engineUsage: EngineUsageSummary[];
+}
+
+interface ValueTextProps {
+  value: string;
+  className?: string;
+  as?: "p" | "span" | "strong";
+}
+
+const SEAT_IDENTITY_STORAGE_KEY = "paperflow-seat-identity";
+const SEAT_SESSION_STORAGE_KEY = "paperflow-seat-session";
+
+function ValueText({
+  value,
+  className,
+  as = "strong",
+}: ValueTextProps): ReactElement {
+  const Component = as;
+  return (
+    <Component className={className ? `value-text ${className}` : "value-text"} title={value}>
+      {value}
+    </Component>
+  );
+}
+
+interface LocaleSwitcherProps {
+  label: string;
+  locale: UiLocale;
+  options: {
+    en: string;
+    zh: string;
+  };
+  className?: string;
+  onChange: (nextLocale: UiLocale) => void;
+}
+
+function LocaleSwitcher({
+  label,
+  locale,
+  options,
+  className,
+  onChange,
+}: LocaleSwitcherProps): ReactElement {
+  return (
+    <section
+      className={className ? `locale-card ${className}` : "locale-card"}
+      aria-label={label}
+    >
+      <span className="locale-label">{label}</span>
+      <div className="locale-toggle">
+        <button
+          className={locale === "en" ? "toggle-active" : undefined}
+          type="button"
+          onClick={() => onChange("en")}
+        >
+          {options.en}
+        </button>
+        <button
+          className={locale === "zh" ? "toggle-active" : undefined}
+          type="button"
+          onClick={() => onChange("zh")}
+        >
+          {options.zh}
+        </button>
+      </div>
+    </section>
+  );
+}
+
+function readStoredIdentity(): string {
+  if (typeof window === "undefined") {
+    return "";
+  }
+  return window.localStorage.getItem(SEAT_IDENTITY_STORAGE_KEY) ?? "";
+}
+
+function persistIdentity(value: string): void {
+  if (typeof window === "undefined") {
+    return;
+  }
+  if (!value) {
+    window.localStorage.removeItem(SEAT_IDENTITY_STORAGE_KEY);
+    return;
+  }
+  window.localStorage.setItem(SEAT_IDENTITY_STORAGE_KEY, value);
+}
+
+function readStoredSeatSession(): SeatSession | null {
+  if (typeof window === "undefined") {
+    return null;
+  }
+  const raw = window.localStorage.getItem(SEAT_SESSION_STORAGE_KEY);
+  if (!raw) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(raw) as Partial<SeatSession>;
+    if (
+      !parsed.seatId ||
+      !parsed.leaseToken ||
+      !parsed.occupantName
+    ) {
+      return null;
+    }
+    return {
+      seatId: parsed.seatId,
+      leaseToken: parsed.leaseToken,
+      occupantName: parsed.occupantName,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function persistSeatSession(session: SeatSession | null): void {
+  if (typeof window === "undefined") {
+    return;
+  }
+  if (!session) {
+    window.localStorage.removeItem(SEAT_SESSION_STORAGE_KEY);
+    return;
+  }
+  window.localStorage.setItem(SEAT_SESSION_STORAGE_KEY, JSON.stringify(session));
+}
+
+function buildSeatPlaceholders(seatCount: number): SeatSummary[] {
+  return Array.from({ length: seatCount }, (_unused, index) => ({
+    seat_id: String(index + 1),
+    status: "available",
+    occupant_name: null,
+    selected_service: null,
+    has_active_job: false,
+    acquired_at: null,
+    last_heartbeat_at: null,
+    claimable: true,
+    message: "Available",
+  }));
+}
+
+function syncSeatList(
+  seats: SeatSummary[],
+  nextSeat: SeatSummary,
+  seatCount: number,
+): SeatSummary[] {
+  const merged = seats.length ? [...seats] : buildSeatPlaceholders(seatCount);
+  const index = merged.findIndex((seat) => seat.seat_id === nextSeat.seat_id);
+  if (index === -1) {
+    merged.push(nextSeat);
+  } else {
+    merged[index] = nextSeat;
+  }
+  return merged.sort(
+    (left, right) => Number(left.seat_id) - Number(right.seat_id),
+  );
+}
+
+function summarizeEngineUsage(seats: SeatSummary[]): EngineUsageSummary[] {
+  const counts = new Map<string, number>();
+
+  for (const seat of seats) {
+    if (seat.status !== "occupied" || !seat.selected_service) {
+      continue;
+    }
+    counts.set(
+      seat.selected_service,
+      (counts.get(seat.selected_service) ?? 0) + 1,
+    );
+  }
+
+  return Array.from(counts.entries())
+    .map(([service, active_seats]) => ({ service, active_seats }))
+    .sort(
+      (left, right) =>
+        right.active_seats - left.active_seats ||
+        left.service.localeCompare(right.service),
+    );
+}
+
+function buildSeatInventory(
+  seats: SeatSummary[],
+  engineUsage: EngineUsageSummary[] = [],
+): SeatInventory {
+  return {
+    seats,
+    engineUsage: engineUsage.length ? engineUsage : summarizeEngineUsage(seats),
+  };
+}
+
+function syncSeatInventory(
+  inventory: SeatInventory,
+  nextSeat: SeatSummary,
+  seatCount: number,
+): SeatInventory {
+  return buildSeatInventory(
+    syncSeatList(inventory.seats, nextSeat, seatCount),
+  );
+}
+
+function formatSeatTimestamp(
+  value: string | null | undefined,
+  locale: UiLocale,
+): string {
+  if (!value) {
+    return locale === "zh" ? "暂无" : "Not yet";
+  }
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) {
+    return value;
+  }
+  return new Intl.DateTimeFormat(locale === "zh" ? "zh-CN" : "en-US", {
+    hour: "2-digit",
+    minute: "2-digit",
+    month: "numeric",
+    day: "numeric",
+  }).format(parsed);
 }
 
 function readStoredLocale(): UiLocale | null {
@@ -542,6 +776,19 @@ function technicalNotes(
 export default function App(): ReactElement {
   const [locale, setLocale] = useState<UiLocale>(() => resolveLocale());
   const [config, setConfig] = useState<AppConfig | null>(null);
+  const [identity, setIdentity] = useState(() => readStoredIdentity());
+  const [identityInput, setIdentityInput] = useState(() => readStoredIdentity());
+  const [seatSession, setSeatSession] = useState<SeatSession | null>(() =>
+    readStoredSeatSession(),
+  );
+  const [seatInventory, setSeatInventory] = useState<SeatInventory>({
+    seats: [],
+    engineUsage: [],
+  });
+  const [seatError, setSeatError] = useState<string | null>(null);
+  const [seatNotice, setSeatNotice] = useState<string | null>(null);
+  const [seatActionId, setSeatActionId] = useState<string | null>(null);
+  const [adminToken, setAdminToken] = useState("");
   const [sourceMode, setSourceMode] = useState<SourceMode>("upload");
   const [sourceFile, setSourceFile] = useState<File | null>(null);
   const [fileUrl, setFileUrl] = useState("");
@@ -565,10 +812,107 @@ export default function App(): ReactElement {
   const [technicalDetails, setTechnicalDetails] = useState<string | null>(null);
   const [rawStage, setRawStage] = useState<string | null>(null);
   const [isRunning, setIsRunning] = useState(false);
+  const [currentJobId, setCurrentJobId] = useState<string | null>(null);
   const controllerRef = useRef<AbortController | null>(null);
   const serviceDraftsRef = useRef<Record<string, FieldValues>>({});
 
   const copy = UI_COPY[locale];
+  const seatText =
+    locale === "zh"
+      ? {
+          loginEyebrow: "共享入口",
+          loginTitle: "先登记身份，再进入翻译席位",
+          loginBody:
+            "每个席位同一时刻只允许一位使用者进入。进入后会持续续租，退出或超时后自动释放。",
+          loginLabel: "姓名或标识",
+          loginPlaceholder: "例如：张三 / lab-1",
+          loginAction: "进入大厅",
+          loginHint: "这里只用于标识当前使用者，不是完整账号系统。",
+          lobbyEyebrow: "席位大厅",
+          lobbyTitle: "选择一个空闲席位",
+          lobbyBody: "已被占用的席位不可进入，除非当前使用者退出或超时释放。",
+          claimAction: "进入席位",
+          occupiedAction: "有人在使用",
+          staleAction: "正在释放",
+          activeSeat: "当前席位",
+          leaveSeat: "退出席位",
+          switchIdentity: "切换身份",
+          adminTitle: "管理释放",
+          adminLabel: "管理口令",
+          adminPlaceholder: "输入管理口令后可强制释放席位",
+          adminAction: "强制释放",
+          heartbeatLabel: "最近心跳",
+          occupantLabel: "使用者",
+          engineLabel: "引擎",
+          engineUnset: "未声明",
+          engineOverviewTitle: "席位引擎占用",
+          engineOverviewBody:
+            "这里展示每个席位最近声明使用的主翻译引擎，方便后来进入的人分流。",
+          engineOverviewEmpty: "当前还没有席位声明使用某个引擎。",
+          engineCountLabel: "使用席位",
+          engineCountValue: "{count} 个席位",
+          engineBusyNotice:
+            "{count} 个席位正在使用 {service}，建议优先尝试其他引擎。",
+          engineCrowdedNotice:
+            "{count} 个席位正在使用 {service}，该引擎当前较拥挤。",
+          jobLabel: "任务",
+          jobIdle: "空闲",
+          jobBusy: "运行中",
+          seatAvailable: "空闲",
+          seatOccupied: "使用中",
+          seatStale: "超时释放中",
+          releasedNotice: "席位已释放。",
+          leaseLost: "席位已失效，请重新进入大厅。",
+          claimFirst: "请先进入一个席位，再开始翻译。",
+        }
+      : {
+          loginEyebrow: "Shared access",
+          loginTitle: "Identify yourself before entering a seat",
+          loginBody:
+            "Each seat only allows one active user at a time. The browser keeps the lease alive until you leave or it times out.",
+          loginLabel: "Name or label",
+          loginPlaceholder: "For example: Alice / lab-1",
+          loginAction: "Enter lobby",
+          loginHint:
+            "This is only used to identify the current occupant, not as a full account system.",
+          lobbyEyebrow: "Seat lobby",
+          lobbyTitle: "Choose an available seat",
+          lobbyBody:
+            "Occupied seats stay locked until the current user leaves or the lease times out.",
+          claimAction: "Enter seat",
+          occupiedAction: "In use",
+          staleAction: "Releasing",
+          activeSeat: "Current seat",
+          leaveSeat: "Leave seat",
+          switchIdentity: "Change identity",
+          adminTitle: "Admin release",
+          adminLabel: "Admin token",
+          adminPlaceholder: "Enter the admin token to force-release a seat",
+          adminAction: "Force release",
+          heartbeatLabel: "Last heartbeat",
+          occupantLabel: "Occupant",
+          engineLabel: "Engine",
+          engineUnset: "Not set",
+          engineOverviewTitle: "Seat engine usage",
+          engineOverviewBody:
+            "Each seat shows the latest main translation engine it has claimed so new arrivals can spread out.",
+          engineOverviewEmpty: "No seat has claimed an engine yet.",
+          engineCountLabel: "Active seats",
+          engineCountValue: "{count} seats",
+          engineBusyNotice:
+            "{count} seats are currently using {service}. Consider another engine first.",
+          engineCrowdedNotice:
+            "{count} seats are currently using {service}. This engine is crowded right now.",
+          jobLabel: "Job",
+          jobIdle: "Idle",
+          jobBusy: "Active",
+          seatAvailable: "Available",
+          seatOccupied: "In use",
+          seatStale: "Releasing after timeout",
+          releasedNotice: "Seat released.",
+          leaseLost: "The seat lease expired. Return to the lobby and enter again.",
+          claimFirst: "Claim a seat before starting a translation.",
+        };
 
   useEffect(() => {
     if (typeof window !== "undefined") {
@@ -577,18 +921,83 @@ export default function App(): ReactElement {
   }, [locale]);
 
   useEffect(() => {
-    void fetchAppConfig()
-      .then((nextConfig) => {
-        const initialService = nextConfig.default_service;
+    let cancelled = false;
+
+    async function bootstrap(): Promise<void> {
+      try {
+        const nextConfig = await fetchAppConfig();
         const nextLocale = resolveLocale(nextConfig.default_locale);
         const nextLanguageOptions = normalizeLanguageOptions(
           nextConfig.translation_languages,
           nextLocale,
         );
+        const initialSeatInventory = await fetchSeats()
+          .then((payload) =>
+            buildSeatInventory(payload.seats, payload.engine_usage),
+          )
+          .catch(() =>
+            buildSeatInventory(
+              buildSeatPlaceholders(nextConfig.seat_management.seat_count),
+            ),
+          );
+        const storedIdentity = readStoredIdentity();
+        const storedSession = readStoredSeatSession();
+        let restoredSession: SeatSession | null = null;
+        let restoredSeat: SeatSummary | null = null;
+
+        if (storedSession) {
+          try {
+            const heartbeat = await heartbeatSeat(
+              storedSession.seatId,
+              storedSession.leaseToken,
+            );
+            restoredSeat = heartbeat.seat;
+            restoredSession = {
+              seatId: heartbeat.seat.seat_id,
+              leaseToken: heartbeat.lease_token,
+              occupantName:
+                heartbeat.seat.occupant_name ?? storedSession.occupantName,
+            };
+            persistSeatSession(restoredSession);
+          } catch {
+            persistSeatSession(null);
+          }
+        }
+
+        if (cancelled) {
+          return;
+        }
+
+        const initialService =
+          restoredSeat?.selected_service ?? nextConfig.default_service;
 
         startTransition(() => {
           setLocale(nextLocale);
           setConfig(nextConfig);
+          setSeatInventory(
+            restoredSession
+              ? syncSeatInventory(
+                  initialSeatInventory,
+                  restoredSeat ?? initialSeatInventory.seats.find(
+                    (seat) => seat.seat_id === restoredSession?.seatId,
+                  ) ?? {
+                    seat_id: restoredSession.seatId,
+                    status: "occupied",
+                    occupant_name: restoredSession.occupantName,
+                    selected_service: null,
+                    has_active_job: false,
+                    acquired_at: null,
+                    last_heartbeat_at: null,
+                    claimable: false,
+                    message: "In use",
+                  },
+                  nextConfig.seat_management.seat_count,
+                )
+              : initialSeatInventory,
+          );
+          setIdentity(restoredSession?.occupantName ?? storedIdentity);
+          setIdentityInput(restoredSession?.occupantName ?? storedIdentity);
+          setSeatSession(restoredSession);
           setService(initialService);
           setLangIn(chooseLanguageCode(nextLanguageOptions, "en"));
           setLangOut(chooseLanguageCode(nextLanguageOptions, "zh-CN", "zh"));
@@ -601,12 +1010,21 @@ export default function App(): ReactElement {
           );
           setStatusKey("intro");
         });
-      })
-      .catch((loadError: Error) => {
+      } catch (loadError) {
+        if (cancelled) {
+          return;
+        }
         setErrorCode("config_unavailable");
-        setTechnicalDetails(loadError.message);
+        setTechnicalDetails((loadError as Error).message);
         setStatusKey("config_unavailable");
-      });
+      }
+    }
+
+    void bootstrap();
+
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   useEffect(() => {
@@ -619,6 +1037,133 @@ export default function App(): ReactElement {
     setSourcePreviewUrl(objectUrl);
     return () => URL.revokeObjectURL(objectUrl);
   }, [sourceFile]);
+
+  useEffect(() => {
+    if (!config) {
+      return;
+    }
+
+    let cancelled = false;
+    async function refreshSeats(): Promise<void> {
+      try {
+        const nextInventory = await fetchSeats();
+        if (!cancelled) {
+          setSeatInventory(
+            buildSeatInventory(nextInventory.seats, nextInventory.engine_usage),
+          );
+        }
+      } catch (error) {
+        if (!cancelled) {
+          setSeatError((error as Error).message);
+        }
+      }
+    }
+
+    void refreshSeats();
+    const intervalId = window.setInterval(() => {
+      void refreshSeats();
+    }, 5000);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(intervalId);
+    };
+  }, [config]);
+
+  useEffect(() => {
+    if (!config || !seatSession) {
+      return;
+    }
+
+    const activeSession = seatSession;
+    const seatCount = config.seat_management.seat_count;
+    let cancelled = false;
+    async function sendHeartbeat(): Promise<void> {
+      try {
+        const response = await heartbeatSeat(
+          activeSession.seatId,
+          activeSession.leaseToken,
+        );
+        if (cancelled) {
+          return;
+        }
+        setSeatInventory((currentInventory) =>
+          syncSeatInventory(
+            currentInventory,
+            response.seat,
+            seatCount,
+          ),
+        );
+      } catch (error) {
+        if (!cancelled) {
+          void handleSeatLeaseLost((error as Error).message);
+        }
+      }
+    }
+
+    const intervalId = window.setInterval(() => {
+      void sendHeartbeat();
+    }, config.seat_management.heartbeat_interval_seconds * 1000);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(intervalId);
+    };
+  }, [config, seatSession]);
+
+  useEffect(() => {
+    if (!config || !seatSession || !service || isRunning) {
+      return;
+    }
+
+    const activeConfig = config;
+    const activeSession = seatSession;
+    const activeSeat = seatInventory.seats.find(
+      (seat) => seat.seat_id === activeSession.seatId,
+    );
+    if (activeSeat?.selected_service === service) {
+      return;
+    }
+
+    let cancelled = false;
+    async function syncSelectedService(): Promise<void> {
+      try {
+        const nextSeat = await updateSeatService(
+          activeSession.seatId,
+          activeSession.leaseToken,
+          service,
+        );
+        if (!cancelled) {
+          setSeatInventory((currentInventory) =>
+            syncSeatInventory(
+              currentInventory,
+              nextSeat,
+              activeConfig.seat_management.seat_count,
+            ),
+          );
+        }
+      } catch (error) {
+        if (cancelled) {
+          return;
+        }
+        if (
+          error instanceof ApiError &&
+          (error.code === "seat_lease_invalid" ||
+            error.code === "seat_lease_expired" ||
+            error.code === "seat_not_found")
+        ) {
+          await handleSeatLeaseLost(error.message);
+          return;
+        }
+        setSeatError((error as Error).message);
+      }
+    }
+
+    void syncSelectedService();
+    return () => {
+      cancelled = true;
+    };
+  }, [config, isRunning, seatInventory.seats, seatSession, service]);
 
   useEffect(() => {
     if (!config) {
@@ -681,6 +1226,8 @@ export default function App(): ReactElement {
   }
 
   const appConfig = config;
+  const seats = seatInventory.seats;
+  const engineUsage = seatInventory.engineUsage;
   const languageOptions = normalizeLanguageOptions(
     appConfig.translation_languages,
     locale,
@@ -747,6 +1294,20 @@ export default function App(): ReactElement {
       : activeTab === "translation"
         ? appConfig.translation_fields
         : appConfig.pdf_fields;
+  const currentServiceSeatCount =
+    engineUsage.find((item) => item.service === service)?.active_seats ?? 0;
+  const currentServiceNotice =
+    currentServiceSeatCount >= 3
+      ? fillTemplate(seatText.engineCrowdedNotice, {
+          count: currentServiceSeatCount,
+          service,
+        })
+      : currentServiceSeatCount >= 2
+        ? fillTemplate(seatText.engineBusyNotice, {
+            count: currentServiceSeatCount,
+            service,
+          })
+        : null;
 
   function handleServiceChange(nextService: string): void {
     serviceDraftsRef.current[service] = engineValues;
@@ -768,8 +1329,186 @@ export default function App(): ReactElement {
     setStatusKey(nextStatus);
   }
 
+  function resetWorkspaceState(): void {
+    const initialService = appConfig.default_service;
+    serviceDraftsRef.current = {};
+    setSourceMode("upload");
+    setSourceFile(null);
+    setFileUrl("");
+    setSourcePreviewUrl(null);
+    setService(initialService);
+    setTranslationValues(buildDefaultValues(appConfig.translation_fields));
+    setPdfValues(buildDefaultValues(appConfig.pdf_fields));
+    setEngineValues(
+      buildDefaultValues(
+        getServiceConfig(appConfig, initialService)?.fields ?? [],
+      ),
+    );
+    setActiveTab("engine");
+    setActiveSection("overview");
+    setSelectedPreviewArtifact(null);
+    setCurrentJobId(null);
+    setIsRunning(false);
+    controllerRef.current = null;
+    resetRunState("intro");
+  }
+
+  async function refreshSeatInventory(): Promise<void> {
+    try {
+      const payload = await fetchSeats();
+      setSeatInventory(buildSeatInventory(payload.seats, payload.engine_usage));
+    } catch (error) {
+      setSeatError((error as Error).message);
+    }
+  }
+
+  async function handleSeatLeaseLost(message: string): Promise<void> {
+    controllerRef.current?.abort();
+    controllerRef.current = null;
+    setCurrentJobId(null);
+    setIsRunning(false);
+    setSeatNotice(null);
+    setSeatError(message || seatText.leaseLost);
+    persistSeatSession(null);
+    setSeatSession(null);
+    resetRunState("intro");
+    await refreshSeatInventory();
+  }
+
+  async function handleIdentitySubmit(): Promise<void> {
+    try {
+      const payload = await loginSeat(identityInput);
+      persistIdentity(payload.display_name);
+      setIdentity(payload.display_name);
+      setIdentityInput(payload.display_name);
+      setSeatError(null);
+      setSeatNotice(null);
+      await refreshSeatInventory();
+    } catch (error) {
+      setSeatError((error as Error).message);
+    }
+  }
+
+  function handleIdentityReset(): void {
+    persistIdentity("");
+    persistSeatSession(null);
+    setIdentity("");
+    setIdentityInput("");
+    setSeatSession(null);
+    setSeatError(null);
+    setSeatNotice(null);
+    resetWorkspaceState();
+  }
+
+  async function handleSeatClaim(seatId: string): Promise<void> {
+    if (!identity) {
+      setSeatError(seatText.claimFirst);
+      return;
+    }
+    setSeatActionId(seatId);
+    try {
+      const response = await claimSeat(seatId, identity);
+      const nextSession: SeatSession = {
+        seatId: response.seat.seat_id,
+        leaseToken: response.lease_token,
+        occupantName: response.seat.occupant_name ?? identity,
+      };
+      persistSeatSession(nextSession);
+      setSeatSession(nextSession);
+      setSeatInventory((currentInventory) =>
+        syncSeatInventory(
+          currentInventory,
+          response.seat,
+          appConfig.seat_management.seat_count,
+        ),
+      );
+      setSeatError(null);
+      setSeatNotice(null);
+      resetWorkspaceState();
+    } catch (error) {
+      setSeatError((error as Error).message);
+      await refreshSeatInventory();
+    } finally {
+      setSeatActionId(null);
+    }
+  }
+
+  async function handleLeaveSeat(): Promise<void> {
+    if (!seatSession) {
+      return;
+    }
+    const activeSession = seatSession;
+    setSeatActionId(activeSession.seatId);
+    controllerRef.current?.abort();
+    controllerRef.current = null;
+    try {
+      const releasedSeat = await releaseSeat(
+        activeSession.seatId,
+        activeSession.leaseToken,
+      );
+      persistSeatSession(null);
+      setSeatSession(null);
+      setSeatInventory((currentInventory) =>
+        syncSeatInventory(
+          currentInventory,
+          releasedSeat,
+          appConfig.seat_management.seat_count,
+        ),
+      );
+      setSeatError(null);
+      setSeatNotice(seatText.releasedNotice);
+      resetWorkspaceState();
+    } catch (error) {
+      if (
+        error instanceof ApiError &&
+        (error.code === "seat_lease_invalid" ||
+          error.code === "seat_lease_expired" ||
+          error.code === "seat_not_found")
+      ) {
+        await handleSeatLeaseLost(error.message);
+      } else {
+        setSeatError((error as Error).message);
+      }
+    } finally {
+      setSeatActionId(null);
+    }
+  }
+
+  async function handleForceSeatRelease(seatId: string): Promise<void> {
+    if (!adminToken.trim()) {
+      setSeatError(seatText.adminPlaceholder);
+      return;
+    }
+    setSeatActionId(seatId);
+    try {
+      const releasedSeat = await forceReleaseSeat(seatId, adminToken.trim());
+      setSeatInventory((currentInventory) =>
+        syncSeatInventory(
+          currentInventory,
+          releasedSeat,
+          appConfig.seat_management.seat_count,
+        ),
+      );
+      if (seatSession?.seatId === seatId) {
+        await handleSeatLeaseLost(seatText.leaseLost);
+      } else {
+        setSeatError(null);
+        setSeatNotice(seatText.releasedNotice);
+      }
+    } catch (error) {
+      setSeatError((error as Error).message);
+    } finally {
+      setSeatActionId(null);
+    }
+  }
+
   async function handleTranslate(): Promise<void> {
     if (isRunning) {
+      return;
+    }
+
+    if (!seatSession) {
+      setSeatError(seatText.claimFirst);
       return;
     }
 
@@ -806,6 +1545,8 @@ export default function App(): ReactElement {
           file: sourceFile,
           fileUrl,
           service,
+          seatId: seatSession.seatId,
+          leaseToken: seatSession.leaseToken,
           uiLocale: locale,
           langIn,
           langOut,
@@ -822,6 +1563,7 @@ export default function App(): ReactElement {
         controller.signal,
         (event) => {
           if (event.type === "status") {
+            setCurrentJobId(event.job.job_id ?? null);
             setStatusKey("running");
             setRawStage(
               event.job.status === "queued"
@@ -845,13 +1587,15 @@ export default function App(): ReactElement {
           }
 
           if (event.type === "error") {
-            setErrorCode(event.error.code ?? "translation_failed");
+            const nextErrorCode = event.error.code ?? "translation_failed";
+            setCurrentJobId(null);
+            setErrorCode(nextErrorCode);
             setTechnicalDetails(
               [event.error.message, event.error.hint]
                 .filter((value) => Boolean(value))
                 .join("\n"),
             );
-            setStatusKey("failed");
+            setStatusKey(nextErrorCode === "job_cancelled" ? "cancelled" : "failed");
             setIsRunning(false);
             controllerRef.current = null;
             return;
@@ -862,6 +1606,7 @@ export default function App(): ReactElement {
           }
 
           setResult(event.result);
+          setCurrentJobId(null);
           setSelectedPreviewArtifact(
             getDefaultPreviewArtifact(event.result, sourcePreview),
           );
@@ -875,18 +1620,36 @@ export default function App(): ReactElement {
     } catch (streamError) {
       if ((streamError as DOMException).name === "AbortError") {
         setStatusKey("cancelled");
+        setCurrentJobId(null);
+      } else if (
+        streamError instanceof ApiError &&
+        (streamError.code === "seat_lease_invalid" ||
+          streamError.code === "seat_lease_expired" ||
+          streamError.code === "seat_required")
+      ) {
+        await handleSeatLeaseLost(streamError.message);
       } else {
         setErrorCode("request_failed");
         setTechnicalDetails((streamError as Error).message);
         setStatusKey("failed");
+        setCurrentJobId(null);
       }
       setIsRunning(false);
       controllerRef.current = null;
     }
   }
 
-  function handleCancel(): void {
+  async function handleCancel(): Promise<void> {
+    if (currentJobId) {
+      try {
+        await cancelJob(currentJobId);
+      } catch (error) {
+        setTechnicalDetails((error as Error).message);
+      }
+    }
     controllerRef.current?.abort();
+    controllerRef.current = null;
+    setCurrentJobId(null);
   }
 
   function handleSwapLanguages(): void {
@@ -898,7 +1661,200 @@ export default function App(): ReactElement {
     setSelectedPreviewArtifact(name);
   }
 
+  const visibleSeats = seats.length
+    ? seats
+    : buildSeatPlaceholders(appConfig.seat_management.seat_count);
+
+  function seatStatusLabelFor(seat: SeatSummary): string {
+    if (seat.status === "stale") {
+      return seatText.seatStale;
+    }
+    if (seat.status === "occupied") {
+      return seatText.seatOccupied;
+    }
+    return seatText.seatAvailable;
+  }
+
+  if (!identity) {
+    return (
+      <div className="seat-shell">
+        <div className="seat-auth-card">
+          <LocaleSwitcher
+            className="locale-card-compact seat-locale-card"
+            label={copy.localeLabel}
+            locale={locale}
+            options={copy.localeOptions}
+            onChange={setLocale}
+          />
+
+          <p className="section-eyebrow">{seatText.loginEyebrow}</p>
+          <h1>{seatText.loginTitle}</h1>
+          <p className="section-copy">{seatText.loginBody}</p>
+
+          <label className="field">
+            <span className="field-label">{seatText.loginLabel}</span>
+            <input
+              className="field-input"
+              placeholder={seatText.loginPlaceholder}
+              type="text"
+              value={identityInput}
+              onChange={(event) => setIdentityInput(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") {
+                  void handleIdentitySubmit();
+                }
+              }}
+            />
+          </label>
+
+          <div className="action-row">
+            <button
+              className="primary-button"
+              type="button"
+              onClick={() => void handleIdentitySubmit()}
+            >
+              {seatText.loginAction}
+            </button>
+          </div>
+
+          <p className="section-copy">{seatText.loginHint}</p>
+          {seatError ? <div className="status-callout">{seatError}</div> : null}
+        </div>
+      </div>
+    );
+  }
+
+  if (!seatSession) {
+    return (
+      <div className="seat-shell">
+        <div className="seat-lobby-shell">
+          <header className="seat-lobby-header">
+            <div>
+              <p className="section-eyebrow">{seatText.lobbyEyebrow}</p>
+              <h1>{seatText.lobbyTitle}</h1>
+              <p className="section-copy">{seatText.lobbyBody}</p>
+            </div>
+
+            <div className="seat-lobby-toolbar">
+              <span className="seat-identity-chip">{identity}</span>
+              <button
+                className="secondary-button"
+                type="button"
+                onClick={handleIdentityReset}
+              >
+                {seatText.switchIdentity}
+              </button>
+              <LocaleSwitcher
+                className="locale-card-compact seat-locale-card"
+                label={copy.localeLabel}
+                locale={locale}
+                options={copy.localeOptions}
+                onChange={setLocale}
+              />
+            </div>
+          </header>
+
+          {seatNotice ? <div className="seat-notice">{seatNotice}</div> : null}
+          {seatError ? <div className="status-callout">{seatError}</div> : null}
+
+          <section className="seat-grid">
+            {visibleSeats.map((seat) => (
+              <article
+                key={seat.seat_id}
+                className={`seat-card seat-card-${seat.status}`}
+              >
+                <div className="seat-card-header">
+                  <div>
+                    <span className="hero-card-label">Seat {seat.seat_id}</span>
+                    <h3>{seatStatusLabelFor(seat)}</h3>
+                  </div>
+                  <span className="seat-card-badge">{seat.message}</span>
+                </div>
+
+                <div className="meta-grid seat-meta-grid">
+                  <div className="meta-item">
+                    <span className="meta-label">{seatText.occupantLabel}</span>
+                    <ValueText
+                      value={seat.occupant_name ?? seatText.seatAvailable}
+                    />
+                  </div>
+                  <div className="meta-item">
+                    <span className="meta-label">{seatText.engineLabel}</span>
+                    <ValueText
+                      value={seat.selected_service ?? seatText.engineUnset}
+                    />
+                  </div>
+                  <div className="meta-item">
+                    <span className="meta-label">{seatText.heartbeatLabel}</span>
+                    <ValueText
+                      value={formatSeatTimestamp(seat.last_heartbeat_at, locale)}
+                    />
+                  </div>
+                  <div className="meta-item">
+                    <span className="meta-label">{seatText.jobLabel}</span>
+                    <ValueText
+                      value={seat.has_active_job ? seatText.jobBusy : seatText.jobIdle}
+                    />
+                  </div>
+                </div>
+
+                <button
+                  className="primary-button seat-enter-button"
+                  disabled={!seat.claimable || seatActionId !== null}
+                  type="button"
+                  onClick={() => void handleSeatClaim(seat.seat_id)}
+                >
+                  {seat.status === "available"
+                    ? seatText.claimAction
+                    : seat.status === "stale"
+                      ? seatText.staleAction
+                      : seatText.occupiedAction}
+                </button>
+
+                {appConfig.seat_management.admin_force_release_enabled ? (
+                  <button
+                    className="secondary-button seat-admin-button"
+                    disabled={seatActionId !== null}
+                    type="button"
+                    onClick={() => void handleForceSeatRelease(seat.seat_id)}
+                  >
+                    {seatText.adminAction}
+                  </button>
+                ) : null}
+              </article>
+            ))}
+          </section>
+
+          {appConfig.seat_management.admin_force_release_enabled ? (
+            <section className="panel-card seat-admin-panel">
+              <div className="section-heading section-heading-compact">
+                <p className="section-eyebrow">{seatText.adminTitle}</p>
+                <h3>{seatText.adminTitle}</h3>
+              </div>
+              <label className="field">
+                <span className="field-label">{seatText.adminLabel}</span>
+                <input
+                  className="field-input"
+                  placeholder={seatText.adminPlaceholder}
+                  type="password"
+                  value={adminToken}
+                  onChange={(event) => setAdminToken(event.target.value)}
+                />
+              </label>
+            </section>
+          ) : null}
+        </div>
+      </div>
+    );
+  }
+
   const noEngineFields = activeTab === "engine" && !activeTabFields.length;
+  const settingsEmptyMessage = noEngineFields
+    ? copy.settings.engineEmptyBody
+    : copy.settings.emptyBody;
+  const settingsEmptyHint = noEngineFields
+    ? copy.settings.engineEmptyHint
+    : undefined;
   const progressPercentLabel = `${Math.max(
     0,
     Math.min(100, Math.round(progress * 100)),
@@ -977,29 +1933,6 @@ export default function App(): ReactElement {
               ? "结果"
               : "Results",
   }));
-  const workspaceContextItems = [
-    {
-      label: copy.launch.stateLabel,
-      value: currentWorkspaceState,
-      tone: currentStatusTone,
-    },
-    {
-      label: copy.launch.sourceLabel,
-      value: sourceReady ? sourceLabel : sourceTransportLabel,
-    },
-    {
-      label: copy.launch.routeLabel,
-      value: routeCompactLabel,
-    },
-    {
-      label: copy.launch.engineLabel,
-      value: service,
-    },
-    {
-      label: copy.launch.outputLabel,
-      value: outputModeLabel,
-    },
-  ];
   const workspaceHeaderTitle =
     activeSection === "overview"
       ? workspaceCopy.titles.overview
@@ -1110,15 +2043,15 @@ export default function App(): ReactElement {
       <div className="meta-grid source-meta-grid">
         <div className="meta-item">
           <span className="meta-label">{copy.source.previewLabel}</span>
-          <strong>{previewStateLabel}</strong>
+          <ValueText value={previewStateLabel} />
         </div>
         <div className="meta-item">
           <span className="meta-label">{copy.source.transportLabel}</span>
-          <strong>{sourceTransportLabel}</strong>
+          <ValueText value={sourceTransportLabel} />
         </div>
         <div className="meta-item">
           <span className="meta-label">{copy.source.safetyLabel}</span>
-          <strong>{copy.source.safetyValue}</strong>
+          <ValueText value={copy.source.safetyValue} />
         </div>
       </div>
     </section>
@@ -1127,143 +2060,186 @@ export default function App(): ReactElement {
   const setupPanel = (
     <section className="panel-card setup-panel workspace-panel">
       <div className="setup-composer">
-        <section className="setup-route-panel">
-          <div className="setup-panel-header">
-            <span className="hero-card-label">{copy.launch.routeLabel}</span>
-            {renderRouteVisual("route-visual-hero")}
+        <section className="setup-primary-panel">
+          <div className="setup-primary-grid">
+            <div className="setup-language-panel">
+              <div className="setup-panel-header">
+                <span className="hero-card-label">{copy.launch.routeLabel}</span>
+                <strong>{copy.route.title}</strong>
+                <p>{copy.route.body}</p>
+              </div>
+
+              <div className="route-language-grid">
+                <label className="field">
+                  <span className="field-label">{copy.route.sourceLanguage}</span>
+                  <select
+                    className="field-input"
+                    value={langIn}
+                    onChange={(event) => setLangIn(event.target.value)}
+                  >
+                    {languageOptions.map((option) => (
+                      <option key={`from-${option.value}`} value={option.value}>
+                        {option.label}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+
+                <button
+                  className="route-swap-button"
+                  type="button"
+                  onClick={handleSwapLanguages}
+                >
+                  <span aria-hidden="true">⇄</span>
+                  <span>{copy.route.swapLanguages}</span>
+                </button>
+
+                <label className="field">
+                  <span className="field-label">{copy.route.targetLanguage}</span>
+                  <select
+                    className="field-input"
+                    value={langOut}
+                    onChange={(event) => setLangOut(event.target.value)}
+                  >
+                    {languageOptions.map((option) => (
+                      <option key={`to-${option.value}`} value={option.value}>
+                        {option.label}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              </div>
+            </div>
+
+            <div className="setup-service-panel">
+              <div className="setup-panel-header">
+                <span className="hero-card-label">{copy.launch.engineLabel}</span>
+                <ValueText className="value-text-wrap" value={service} />
+                <p>
+                  {service === "SiliconFlowFree"
+                    ? copy.route.freeEngineBody
+                    : copy.route.privateEngineBody}
+                </p>
+              </div>
+
+              <label className="field route-service-field route-service-field-full">
+                <span className="field-label">{copy.route.service}</span>
+                <select
+                  className="field-input"
+                  value={service}
+                  onChange={(event) => handleServiceChange(event.target.value)}
+                >
+                  {appConfig.services.map((item) => (
+                    <option key={item.name} value={item.name}>
+                      {item.name}
+                    </option>
+                  ))}
+                </select>
+              </label>
+
+              {currentServiceNotice ? (
+                <div className="status-callout engine-usage-alert">
+                  <strong className="value-text value-text-wrap">{service}</strong>
+                  <p className="section-copy">{currentServiceNotice}</p>
+                </div>
+              ) : null}
+            </div>
           </div>
 
-          <div className="route-language-grid">
-            <label className="field">
-              <span className="field-label">{copy.route.sourceLanguage}</span>
-              <select
-                className="field-input"
-                value={langIn}
-                onChange={(event) => setLangIn(event.target.value)}
-              >
-                {languageOptions.map((option) => (
-                  <option key={`from-${option.value}`} value={option.value}>
-                    {option.label}
-                  </option>
-                ))}
-              </select>
-            </label>
+          <div className="engine-usage-shell">
+            <div className="engine-usage-head">
+              <strong>{seatText.engineOverviewTitle}</strong>
+              <p>{seatText.engineOverviewBody}</p>
+            </div>
 
-            <button
-              className="route-swap-button"
-              type="button"
-              onClick={handleSwapLanguages}
-            >
-              <span aria-hidden="true">⇄</span>
-              <span>{copy.route.swapLanguages}</span>
-            </button>
-
-            <label className="field">
-              <span className="field-label">{copy.route.targetLanguage}</span>
-              <select
-                className="field-input"
-                value={langOut}
-                onChange={(event) => setLangOut(event.target.value)}
-              >
-                {languageOptions.map((option) => (
-                  <option key={`to-${option.value}`} value={option.value}>
-                    {option.label}
-                  </option>
+            {engineUsage.length ? (
+              <div className="engine-usage-list" aria-label={seatText.engineOverviewTitle}>
+                {engineUsage.map((item) => (
+                  <article
+                    key={item.service}
+                    className={`engine-usage-row${item.service === service ? " engine-usage-row-active" : ""}`}
+                  >
+                    <div className="engine-usage-row-main">
+                      <ValueText className="value-text-wrap" value={item.service} />
+                    </div>
+                    <div className="engine-usage-row-side">
+                      <strong>
+                        {fillTemplate(seatText.engineCountValue, {
+                          count: item.active_seats,
+                        })}
+                      </strong>
+                      <span className="field-hint">{seatText.engineCountLabel}</span>
+                    </div>
+                  </article>
                 ))}
-              </select>
-            </label>
+              </div>
+            ) : (
+              <div className="notice-card engine-usage-empty">
+                <p className="notice-title">{seatText.engineOverviewTitle}</p>
+                <p>{seatText.engineOverviewEmpty}</p>
+              </div>
+            )}
           </div>
         </section>
 
-        <section className="setup-engine-panel">
-          <div className="setup-panel-header">
-            <span className="hero-card-label">{copy.launch.engineLabel}</span>
-            <strong>{service}</strong>
-            <p>
-              {service === "SiliconFlowFree"
-                ? copy.route.freeEngineBody
-                : copy.route.privateEngineBody}
-            </p>
+        <section className="setup-settings-panel">
+          <div className="setup-settings-header">
+            <div className="section-heading section-heading-compact">
+              <p className="section-eyebrow">{copy.settings.eyebrow}</p>
+              <h3>{copy.settings.titles[activeTab]}</h3>
+              <p className="section-copy">{copy.settings.descriptions[activeTab]}</p>
+            </div>
+
+            <div className="settings-tabs">
+              {(["engine", "translation", "pdf"] as const).map((tab) => (
+                <button
+                  key={tab}
+                  className={activeTab === tab ? "tab-active" : undefined}
+                  type="button"
+                  onClick={() => setActiveTab(tab)}
+                >
+                  {copy.settings.tabs[tab]}
+                </button>
+              ))}
+            </div>
           </div>
 
-          <label className="field route-service-field route-service-field-full">
-            <span className="field-label">{copy.route.service}</span>
-            <select
-              className="field-input"
-              value={service}
-              onChange={(event) => handleServiceChange(event.target.value)}
-            >
-              {appConfig.services.map((item) => (
-                <option key={item.name} value={item.name}>
-                  {item.name}
-                </option>
-              ))}
-            </select>
-          </label>
+          <SettingsSection
+            title={copy.settings.titles[activeTab]}
+            eyebrow={copy.settings.tabs[activeTab]}
+            description={copy.settings.descriptions[activeTab]}
+            emptyTitle={copy.settings.emptyTitle}
+            emptyMessage={settingsEmptyMessage}
+            emptyHint={settingsEmptyHint}
+            locale={locale}
+            fieldLabels={{
+              leaveBlank: copy.field.leaveBlankSecret,
+              required: copy.field.required,
+              optional: copy.field.optional,
+              useDefault: copy.field.useDefault,
+            }}
+            fields={activeTabFields}
+            values={
+              activeTab === "engine"
+                ? engineValues
+                : activeTab === "translation"
+                  ? translationValues
+                  : pdfValues
+            }
+            onChange={(name, value) => {
+              if (activeTab === "engine") {
+                updateFieldValues(setEngineValues, name, value);
+                return;
+              }
+              if (activeTab === "translation") {
+                updateFieldValues(setTranslationValues, name, value);
+                return;
+              }
+              updateFieldValues(setPdfValues, name, value);
+            }}
+          />
         </section>
       </div>
-
-      <section className="setup-settings-panel">
-        <div className="setup-settings-header">
-          <div className="section-heading section-heading-compact">
-            <p className="section-eyebrow">{copy.settings.eyebrow}</p>
-            <h3>{copy.settings.titles[activeTab]}</h3>
-            <p className="section-copy">{copy.settings.descriptions[activeTab]}</p>
-          </div>
-
-          <div className="settings-tabs">
-            {(["engine", "translation", "pdf"] as const).map((tab) => (
-              <button
-                key={tab}
-                className={activeTab === tab ? "tab-active" : undefined}
-                type="button"
-                onClick={() => setActiveTab(tab)}
-              >
-                {copy.settings.tabs[tab]}
-              </button>
-            ))}
-          </div>
-        </div>
-
-        <SettingsSection
-          title={copy.settings.titles[activeTab]}
-          eyebrow={copy.settings.tabs[activeTab]}
-          description={copy.settings.descriptions[activeTab]}
-          emptyMessage={
-            noEngineFields
-              ? locale === "zh"
-                ? "当前引擎没有额外的前端配置项。"
-                : "This engine does not expose extra frontend settings."
-              : undefined
-          }
-          locale={locale}
-          fieldLabels={{
-            leaveBlank: copy.field.leaveBlankSecret,
-            required: copy.field.required,
-            optional: copy.field.optional,
-            useDefault: copy.field.useDefault,
-          }}
-          fields={activeTabFields}
-          values={
-            activeTab === "engine"
-              ? engineValues
-              : activeTab === "translation"
-                ? translationValues
-                : pdfValues
-          }
-          onChange={(name, value) => {
-            if (activeTab === "engine") {
-              updateFieldValues(setEngineValues, name, value);
-              return;
-            }
-            if (activeTab === "translation") {
-              updateFieldValues(setTranslationValues, name, value);
-              return;
-            }
-            updateFieldValues(setPdfValues, name, value);
-          }}
-        />
-      </section>
     </section>
   );
 
@@ -1299,13 +2275,13 @@ export default function App(): ReactElement {
       <div className="overview-status-grid">
         <div className="summary-pill summary-pill-primary">
           <span className="summary-label">{copy.launch.stateLabel}</span>
-          <strong>{currentWorkspaceState}</strong>
+          <ValueText value={currentWorkspaceState} />
           <p className="section-copy">{currentMessage}</p>
         </div>
 
         <div className="summary-pill">
           <span className="summary-label">{copy.launch.backendStageLabel}</span>
-          <strong>{currentStage}</strong>
+          <ValueText value={currentStage} />
           <p className="section-copy">{progressPercentLabel}</p>
         </div>
       </div>
@@ -1318,19 +2294,19 @@ export default function App(): ReactElement {
       <div className="overview-summary-grid">
         <div className="summary-pill">
           <span className="summary-label">{copy.launch.sourceLabel}</span>
-          <strong>{sourceLabel}</strong>
+          <ValueText value={sourceLabel} />
         </div>
         <div className="summary-pill">
           <span className="summary-label">{copy.launch.engineLabel}</span>
-          <strong>{service}</strong>
+          <ValueText value={service} />
         </div>
         <div className="summary-pill">
           <span className="summary-label">{copy.launch.pagesLabel}</span>
-          <strong>{pageScopeLabel}</strong>
+          <ValueText value={pageScopeLabel} />
         </div>
         <div className="summary-pill">
           <span className="summary-label">{copy.launch.outputLabel}</span>
-          <strong>{outputModeLabel}</strong>
+          <ValueText value={outputModeLabel} />
         </div>
       </div>
     </section>
@@ -1348,6 +2324,33 @@ export default function App(): ReactElement {
         </div>
         <span className="status-pill">{progressPercentLabel}</span>
       </div>
+
+      <section className="control-summary-card" aria-label={workspaceCopy.contextTitle}>
+        <div className="control-summary-head">
+          <span className="hero-card-label">{workspaceCopy.contextTitle}</span>
+        </div>
+
+        {renderRouteVisual("route-visual-control")}
+
+        <div className="control-summary-meta">
+          <div className="control-summary-item">
+            <span className="meta-label">{copy.launch.engineLabel}</span>
+            <ValueText
+              as="p"
+              className="control-summary-value value-text-wrap"
+              value={service}
+            />
+          </div>
+          <div className="control-summary-item">
+            <span className="meta-label">{copy.source.transportLabel}</span>
+            <ValueText
+              as="p"
+              className="control-summary-value"
+              value={sourceTransportLabel}
+            />
+          </div>
+        </div>
+      </section>
 
       <div className="status-meter">
         <div
@@ -1381,29 +2384,18 @@ export default function App(): ReactElement {
           className="secondary-button"
           disabled={!isRunning}
           type="button"
-          onClick={handleCancel}
+          onClick={() => void handleCancel()}
         >
           {copy.launch.cancel}
         </button>
-      </div>
-
-      <div className="meta-grid inspector-meta-grid">
-        <div className="meta-item inspector-meta-item">
-          <span className="meta-label">{copy.launch.sourceLabel}</span>
-          <strong>{sourceLabel}</strong>
-        </div>
-        <div className="meta-item inspector-meta-item">
-          <span className="meta-label">{copy.launch.engineLabel}</span>
-          <strong>{service}</strong>
-        </div>
-        <div className="meta-item inspector-meta-item">
-          <span className="meta-label">{copy.launch.outputLabel}</span>
-          <strong>{outputModeLabel}</strong>
-        </div>
-        <div className="meta-item inspector-meta-item">
-          <span className="meta-label">{copy.launch.routeLabel}</span>
-          <strong>{routeCompactLabel}</strong>
-        </div>
+        <button
+          className="secondary-button"
+          disabled={seatActionId !== null}
+          type="button"
+          onClick={() => void handleLeaveSeat()}
+        >
+          {seatText.leaveSeat}
+        </button>
       </div>
 
       {currentErrorTitle ? (
@@ -1467,7 +2459,7 @@ export default function App(): ReactElement {
             <div className="sidebar-brand-mark">PF</div>
             <div className="sidebar-brand-copy">
               <strong>{copy.appName}</strong>
-              <span>{currentWorkspaceState}</span>
+              <span>{`Seat ${seatSession.seatId} · ${currentWorkspaceState}`}</span>
             </div>
           </div>
 
@@ -1495,58 +2487,27 @@ export default function App(): ReactElement {
 
           <div className="sidebar-footer">
             <span className="section-eyebrow">{workspaceCopy.contextTitle}</span>
-            <strong>{routeLabel}</strong>
-            <p>{service}</p>
+            <ValueText value={routeCompactLabel} />
           </div>
         </aside>
 
         <main className="app-workspace">
           <header className="workspace-topbar">
-            <div className="workspace-header-main">
+            <div className="workspace-header-main workspace-header-main-compact">
               <div className="workspace-title-block">
                 <p className="section-eyebrow">{activeWorkspaceSection.label}</p>
                 <h1>{workspaceHeaderTitle}</h1>
                 <p className="section-copy">{workspaceHeaderBody}</p>
               </div>
-
-              <div
-                className="workspace-context-bar"
-                aria-label={workspaceCopy.contextTitle}
-              >
-                {workspaceContextItems.map((item) => (
-                  <div
-                    key={item.label}
-                    className={`workspace-context-chip${item.tone ? ` workspace-context-chip-${item.tone}` : ""}`}
-                  >
-                    <span className="workspace-context-label">{item.label}</span>
-                    <strong>{item.value}</strong>
-                  </div>
-                ))}
-              </div>
             </div>
 
-            <section
-              className="locale-card locale-card-compact"
-              aria-label={copy.localeLabel}
-            >
-              <span className="locale-label">{copy.localeLabel}</span>
-              <div className="locale-toggle">
-                <button
-                  className={locale === "en" ? "toggle-active" : undefined}
-                  type="button"
-                  onClick={() => setLocale("en")}
-                >
-                  {copy.localeOptions.en}
-                </button>
-                <button
-                  className={locale === "zh" ? "toggle-active" : undefined}
-                  type="button"
-                  onClick={() => setLocale("zh")}
-                >
-                  {copy.localeOptions.zh}
-                </button>
-              </div>
-            </section>
+            <LocaleSwitcher
+              className="locale-card-compact workspace-locale-card"
+              label={copy.localeLabel}
+              locale={locale}
+              options={copy.localeOptions}
+              onChange={setLocale}
+            />
           </header>
 
           <div
