@@ -53,6 +53,13 @@ class TestBuildArgsParser:
 
         assert parsed_args.translate_table_text is False
 
+    def test_gui_server_host_flag_is_available(self):
+        parser, _ = build_args_parser()
+
+        parsed_args = parser.parse_args(["--server-host", "0.0.0.0"])
+
+        assert parsed_args.server_host == "0.0.0.0"
+
     def test_help_includes_quick_start_examples(self):
         parser, _ = build_args_parser()
 
@@ -77,6 +84,7 @@ class TestConfigManager:
             "PDF2ZH_DEBUG": "true",
             "PDF2ZH_REPORT_INTERVAL": "0.5",
             "PDF2ZH_QPS": "10",
+            "PDF2ZH_SERVER_HOST": "0.0.0.0",
             "PDF2ZH_INPUT_FILES": '["test1.pdf", "test2.pdf"]',
             "PDF2ZH_INVALID_KEY": "value",  # Should be ignored
         }
@@ -89,6 +97,7 @@ class TestConfigManager:
         assert env_settings["basic"]["debug"] is True
         assert env_settings["report_interval"] == 0.5
         assert env_settings["translation"]["qps"] == 10
+        assert env_settings["gui_settings"]["server_host"] == "0.0.0.0"
         assert "invalid_key" not in env_settings
 
     def test_convert_env_value(self):

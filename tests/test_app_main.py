@@ -104,6 +104,8 @@ def test_main_restores_offline_assets(monkeypatch):
 def test_main_reports_gui_startup_failure(capsys, monkeypatch):
     settings = build_settings()
     settings.basic.gui = True
+    settings.gui_settings.server_host = "0.0.0.0"
+    settings.gui_settings.server_port = 9000
     init_config = Mock(return_value=settings)
     monkeypatch.setattr(
         "pdf2zh_next.main.ConfigManager.initialize_config",
@@ -121,7 +123,7 @@ def test_main_reports_gui_startup_failure(capsys, monkeypatch):
     assert "Failed to start GUI: no local port was available" in captured.err
     assert "Retry the GUI with --server-port <free-port>" in captured.err
     warmup_mock.assert_called_once()
-    setup_gui_mock.assert_awaited_once()
+    setup_gui_mock.assert_awaited_once_with(server_host="0.0.0.0", server_port=9000)
 
 
 def test_main_returns_non_zero_when_translation_reports_errors(monkeypatch, tmp_path):

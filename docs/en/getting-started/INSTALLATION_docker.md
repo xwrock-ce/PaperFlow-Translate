@@ -10,27 +10,55 @@
 
 #### Installation
 
-<h4>1. Pull and run:</h4>
+<h4>1. Build and run from this repository:</h4>
 
 ```bash
-docker pull awwaawwa/pdfmathtranslate-next
-docker run -d -p 7860:7860 awwaawwa/pdfmathtranslate-next
+cp .env.example .env
+docker compose build
+docker compose up -d
 ```
 
 > [!NOTE]
-> 
-> - If you cannot access Docker Hub, please try the image on [GitHub Container Registry](https://github.com/PDFMathTranslate/PDFMathTranslate-next/pkgs/container/pdfmathtranslate).
-> 
+>
+> The repository `Dockerfile` builds the React frontend at image-build time and starts the WebUI with `--server-host 0.0.0.0`, which makes it suitable for cloud servers and container port publishing.
+
+<h4>2. Or pull and run a published image directly:</h4>
+
+```bash
+docker pull awwaawwa/pdfmathtranslate-next
+docker run -d --name pdf2zh-next -p 7860:7860 awwaawwa/pdfmathtranslate-next pdf2zh --gui --server-host 0.0.0.0
+```
+
+> [!NOTE]
+>
+> If you cannot access Docker Hub, try the image on [GitHub Container Registry](https://github.com/PDFMathTranslate/PDFMathTranslate-next/pkgs/container/pdfmathtranslate).
+>
 > ```bash
 > docker pull ghcr.io/PDFMathTranslate/PDFMathTranslate-next
-> docker run -d -p 7860:7860 ghcr.io/PDFMathTranslate/PDFMathTranslate-next
+> docker run -d --name pdf2zh-next -p 7860:7860 ghcr.io/PDFMathTranslate/PDFMathTranslate-next pdf2zh --gui --server-host 0.0.0.0
 > ```
 
-<h4>2. Enter this URL in your default browser to open the WebUI page:</h4>
+<h4>3. Enter this URL in your browser to open the WebUI page:</h4>
 
 ```
-http://localhost:7860/
+http://127.0.0.1:17860/
 ```
+
+The included compose file binds the service to `127.0.0.1:17860` by default. Change `.env` if you need another host port:
+
+```bash
+PDF2ZH_BIND_IP=127.0.0.1
+PDF2ZH_WEB_PORT=17860
+```
+
+If you are connecting through a reverse proxy, proxy to `127.0.0.1:17860`. If you really want to expose the container directly on the public network, set `PDF2ZH_BIND_IP=0.0.0.0`.
+
+> [!NOTE]
+>
+> The included `docker-compose.yml` persists:
+>
+> - `./data/config` for saved WebUI settings and default config files
+> - `./data/output` for uploaded PDFs and generated artifacts
 
 > [!NOTE]
 > If you encounter any issues during use WebUI, please refer to [Usage --> WebUI](./USAGE_webui.md).

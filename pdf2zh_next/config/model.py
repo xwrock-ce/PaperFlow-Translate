@@ -61,6 +61,7 @@ class BasicSettings(BaseModel):
 class GUISettings(BaseModel):
     """GUI related settings"""
 
+    server_host: str = Field(default="127.0.0.1", description="WebUI host")
     server_port: int = Field(default=7860, description="WebUI port")
     ui_lang: str | None = Field(default="en", description="Default WebUI language")
 

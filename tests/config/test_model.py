@@ -3,6 +3,7 @@ from pathlib import Path
 import pytest
 from pdf2zh_next.config.cli_env_model import CLIEnvSettingsModel
 from pdf2zh_next.config.model import BasicSettings
+from pdf2zh_next.config.model import GUISettings
 from pdf2zh_next.config.model import PDFSettings
 from pdf2zh_next.config.model import TranslationSettings
 from pdf2zh_next.config.translate_engine_model import OpenAISettings
@@ -84,6 +85,14 @@ class TestTranslationSettings:
         assert settings.output == str(tmp_path)
         assert settings.qps == 10
         assert settings.ignore_cache is True
+
+
+class TestGUISettings:
+    def test_default_values(self):
+        """Test default values of GUISettings"""
+        settings = GUISettings()
+        assert settings.server_host == "127.0.0.1"
+        assert settings.server_port == 7860
 
 
 class TestPDFSettings:

@@ -95,6 +95,31 @@ python -m pdf2zh_next ./paper.pdf --output ./translated
 
 If you do not pass an engine flag such as `--openai`, the CLI uses `SiliconFlowFree` by default. On the first run, BabelDOC assets are downloaded automatically. If your network blocks `api1.pdf2zh-next.com` or `api2.pdf2zh-next.com`, switch to another service or pre-download the assets with `pdf2zh_next --warmup`. When the local WebUI port is busy, start it with `--server-port <free-port>`.
 When you run the new React-based WebUI from a source checkout, `npm` must be available locally because `pdf2zh_next --gui` will build the frontend automatically if the static assets are missing.
+For remote servers or Docker containers, bind the WebUI to all interfaces with `pdf2zh_next --gui --server-host 0.0.0.0`.
+
+### Docker Deployment
+
+This repository includes a multi-stage `Dockerfile` that builds the React frontend during the image build, so the runtime container does not need `npm`.
+
+```bash
+cp .env.example .env
+docker compose build
+docker compose up -d
+```
+
+Then open:
+
+```text
+http://127.0.0.1:17860/
+```
+
+The included [`docker-compose.yml`](./docker-compose.yml) persists:
+
+- `./data/config` for saved WebUI settings and default config files
+- `./data/output` for uploaded PDFs and generated artifacts
+
+By default the compose file publishes the container to `127.0.0.1:17860` on the host to avoid conflicts with other services and to make it easy to place a reverse proxy in front. Change `PDF2ZH_WEB_PORT` in `.env` if `17860` is already occupied. Set `PDF2ZH_BIND_IP=0.0.0.0` only when you intentionally want to expose the service directly.
+An example Nginx virtual host is included at [`deploy/nginx/pdf2zh-next.conf.example`](./deploy/nginx/pdf2zh-next.conf.example).
 
 <h2 id="usage">Advanced Options</h2>
 
@@ -144,5 +169,3 @@ If you don't know what code to use to translate to the language you need, check 
 <h2 id="conduct">Before submit your code</h2>
 
 We welcome the active participation of contributors to make pdf2zh better. Before you are ready to submit your code, please refer to our [Code of Conduct](https://pdf2zh-next.com/community/CODE_OF_CONDUCT.html) and [Contribution Guide](https://pdf2zh-next.com/community/Contribution-Guide.html).
-
-

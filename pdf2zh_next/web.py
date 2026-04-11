@@ -15,11 +15,11 @@ def _frontend_root_dir() -> Path:
     return Path(__file__).resolve().parent.parent / "frontend"
 
 
-def _ensure_port_available(port: int) -> None:
+def _ensure_port_available(host: str, port: int) -> None:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
         probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
-            probe.bind(("127.0.0.1", port))
+            probe.bind((host, port))
         except OSError as exc:
             raise RuntimeError(
                 f"Port {port} is already in use. Start the GUI with --server-port <free-port>."
@@ -46,13 +46,14 @@ def _ensure_frontend_build() -> None:
 
 
 async def setup_gui(
+    server_host: str = "127.0.0.1",
     server_port: int = 7860,
 ) -> None:
-    _ensure_port_available(server_port)
+    _ensure_port_available(server_host, server_port)
     _ensure_frontend_build()
     config = uvicorn.Config(
         create_app(serve_frontend=True),
-        host="127.0.0.1",
+        host=server_host,
         port=server_port,
     )
     server = uvicorn.Server(config)

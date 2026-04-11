@@ -1,0 +1,14 @@
+services:
+  pdf2zh-next:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: pdf2zh-next
+    ports:
+      - "${PDF2ZH_BIND_IP:-127.0.0.1}:${PDF2ZH_WEB_PORT:-17860}:7860"
+    volumes:
+      - ./data/config:/root/.config/pdf2zh
+      - ./data/output:/app/pdf2zh_files
+    environment:
+      TZ: "${TZ:-Asia/Shanghai}"
+    restart: unless-stopped

@@ -255,7 +255,10 @@ async def main() -> int:
 
         _warmup_assets()
         try:
-            await setup_gui(server_port=settings.gui_settings.server_port)
+            await setup_gui(
+                server_host=settings.gui_settings.server_host,
+                server_port=settings.gui_settings.server_port,
+            )
         except Exception as exc:
             _print_cli_error(
                 f"Failed to start GUI: {exc}",
