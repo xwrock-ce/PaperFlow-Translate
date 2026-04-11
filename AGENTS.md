@@ -1,110 +1,140 @@
 # Repository Guidelines
 
-## Project Overview
-- `pdf2zh_next/` is the main application package.
-- Public entry points that should stay aligned with code, docs, and examples:
-  `pdf2zh_next ...` for the CLI;
-  `pdf2zh_next --gui` for the local GUI;
-  `python -m pdf2zh_next.http_api` for the HTTP API.
-- The current browser workflow is seat-based:
-  the WebUI and HTTP API coordinate seat claiming, heartbeats, release, and per-seat engine selection.
+## Current Project State
+- Repository directory is `PaperFlow-Translate`, but the maintained Python package, CLI names, and published package metadata are still `pdf2zh_next` / `pdf2zh-next`. Keep runtime names, docs, and examples aligned with the package, not the folder name.
+- Main runtime package: `pdf2zh_next/`.
+- Supported Python range: `>=3.10,<3.14`.
+- Frontend stack: React 19 + TypeScript + Vite in `frontend/`.
+- The browser workflow is seat-based. The React WebUI and FastAPI backend coordinate seat claiming, heartbeats, release, active-job binding, and per-seat service selection.
 
-## Project Structure
+## Public Entry Points
+- CLI: `pdf2zh`, `pdf2zh2`, `pdf2zh_next`, `python -m pdf2zh_next`
+- Local GUI: `pdf2zh_next --gui`
+- HTTP API: `python -m pdf2zh_next.http_api`
+- Asset maintenance: `pdf2zh_next --warmup`, `--generate-offline-assets`, `--restore-offline-assets`
+
+## Repository Layout
 - Runtime entry points:
-  `pdf2zh_next/main.py` is the primary CLI entry;
-  `pdf2zh_next/__main__.py` supports `python -m pdf2zh_next`;
-  `pdf2zh_next/web.py` starts the local GUI and builds the frontend when needed;
-  `pdf2zh_next/http_api.py` defines the FastAPI app, translation endpoints, seat-management endpoints, and frontend asset serving;
-  `pdf2zh_next/high_level.py` contains the reusable translation workflow and PDF validation helpers.
-- Configuration lives under `pdf2zh_next/config/`:
-  `main.py` handles CLI parsing;
-  `model.py`, `cli_env_model.py`, and `translate_engine_model.py` define settings and engine metadata.
-- Translation internals live under `pdf2zh_next/translator/`:
-  `translator_impl/` contains engine integrations;
-  `rate_limiter/` contains throttling implementations;
-  `cache.py`, `base_translator.py`, and `base_rate_limiter.py` define shared translator primitives.
-- WebUI contract and localization helpers live in:
-  `pdf2zh_next/web_schema.py`,
-  `pdf2zh_next/webui_payload.py`,
-  `pdf2zh_next/web_localization.py`,
-  `pdf2zh_next/web_i18n.py`,
-  `pdf2zh_next/ui_options.py`.
-- Shared assets and helpers live under `pdf2zh_next/assets/` and `pdf2zh_next/utils/`.
-- `frontend/` is the React 19 + TypeScript + Vite WebUI:
-  `frontend/src/App.tsx` is the main shell;
-  `frontend/src/components/` contains page sections and panels;
-  `frontend/src/lib/` contains API clients, shared types, and i18n/copy helpers;
-  `frontend/src/styles/app.css` is the main stylesheet;
-  `frontend/dist/` is generated output.
-- Tests live under `tests/`:
-  `tests/test_app_main.py` covers CLI startup;
-  `tests/test_user_experience.py` covers user-facing flows and errors;
-  `tests/test_http_api.py` covers FastAPI routes, streaming, and seat management;
-  `tests/test_high_level.py` covers the translation pipeline;
-  `tests/config/` covers config parsing and settings models.
-- Fixtures and docs:
-  `test/file/` contains sample PDFs for smoke checks;
-  `docs/` contains the MkDocs site and localized docs;
-  `script/` and the repository `Dockerfile` contain packaging and deployment helpers.
+  - `pdf2zh_next/main.py`: primary CLI flow
+  - `pdf2zh_next/__main__.py`: `python -m pdf2zh_next`
+  - `pdf2zh_next/web.py`: local GUI startup; builds `frontend/dist/` when missing
+  - `pdf2zh_next/http_api.py`: FastAPI app, translation routes, seat-management routes, job handling, and frontend asset serving
+  - `pdf2zh_next/high_level.py`: shared translation pipeline and PDF validation helpers
+- Configuration:
+  - `pdf2zh_next/config/main.py`: CLI parser and config manager
+  - `pdf2zh_next/config/model.py`: settings models
+  - `pdf2zh_next/config/cli_env_model.py`: CLI and environment bridge
+  - `pdf2zh_next/config/translate_engine_model.py`: translation engine metadata and UI field definitions
+- Translation internals:
+  - `pdf2zh_next/translator/translator_impl/`: service integrations
+  - `pdf2zh_next/translator/rate_limiter/`: throttling implementations
+  - `pdf2zh_next/translator/cache.py`, `base_translator.py`, `base_rate_limiter.py`: shared translator primitives
+- WebUI contract helpers:
+  - `pdf2zh_next/web_schema.py`
+  - `pdf2zh_next/webui_payload.py`
+  - `pdf2zh_next/web_localization.py`
+  - `pdf2zh_next/web_i18n.py`
+  - `pdf2zh_next/ui_options.py`
+- Frontend:
+  - `frontend/src/App.tsx`: app shell
+  - `frontend/src/components/`: upload, settings, progress, preview, and download panels
+  - `frontend/src/lib/`: API client, types, copy, and i18n helpers
+  - `frontend/src/styles/app.css`: shared styling
+- Tests:
+  - `tests/test_app_main.py`: CLI startup and control flow
+  - `tests/test_user_experience.py`: user-facing CLI flows and errors
+  - `tests/test_http_api.py`: FastAPI routes, streaming, static serving, browser payloads, and seat management
+  - `tests/test_high_level.py`: translation pipeline
+  - `tests/config/`: config parsing and settings models
+- Docs and packaging:
+  - `docs/`: multilingual MkDocs source
+  - `script/`: helper scripts and container variants
+  - `Dockerfile`: container packaging
+  - `test/file/`: PDF fixtures for smoke checks
 
-## Generated Artifacts
-- Treat these as generated unless the task explicitly targets them:
-  `.doctemp/`, `pdf2zh_files/`, `.pytest_cache/`, `.ruff_cache/`, `.venv/`,
-  `frontend/dist/`, `frontend/node_modules/`, `frontend/*.tsbuildinfo`, and all `__pycache__/` directories.
-- Do not treat generated output as source of truth unless the task is specifically about build artifacts, packaging, or fixtures.
+## Source Of Truth
+- Treat source files under `pdf2zh_next/`, `frontend/src/`, `tests/`, `README.md`, and `docs/` as the authority.
+- Do not infer current behavior from generated output, cached `.pyc` files, or build artifacts.
+- Keep CLI help text, README examples, docs pages, API behavior, and frontend/backend payload contracts synchronized when public behavior changes.
+
+## Generated And Local Artifacts
+- Treat these as generated or local-only unless the task explicitly targets them:
+  - `.doctemp/`
+  - `pdf2zh_files/`
+  - `.pytest_cache/`
+  - `.ruff_cache/`
+  - `.venv/`
+  - `frontend/dist/`
+  - `frontend/node_modules/`
+  - `frontend/*.tsbuildinfo`
+  - all `__pycache__/` directories
+- Do not use generated output as source when updating code or docs.
 
 ## Development Commands
 - Install Python dependencies: `uv sync`
-- Run the full test suite: `uv run pytest .`
+- Run all tests: `uv run pytest .`
 - Run focused tests:
-  `uv run pytest tests/test_app_main.py tests/test_user_experience.py`
-  `uv run pytest tests/test_http_api.py`
-  `uv run pytest tests/test_high_level.py`
-  `uv run pytest tests/config/test_main.py tests/config/test_model.py`
-- Lint and format: `uv run ruff check .` and `uv run ruff format .`
-- Warm up BabelDOC assets: `uv run pdf2zh_next --warmup`
-- CLI smoke checks:
-  `uv run pdf2zh_next ./test/file/translate.cli.plain.text.pdf --output ./test/file`
-  `uv run pdf2zh_next ./test/file/translate.cli.text.with.figure.pdf --output ./test/file`
-- Start the local GUI: `timeout 10 uv run pdf2zh_next --gui`
-  if port `7860` is already occupied, use `--server-port <free-port>`.
-- Start the HTTP API: `uv run python -m pdf2zh_next.http_api`
-- Build the frontend directly: `cd frontend && npm install && npm run build`
-- Build the package: `uv build`
-- Preview docs locally: `uv run mkdocs serve`
-- Run pre-commit hooks: `uv run pre-commit run --all-files`
+  - CLI and UX: `uv run pytest tests/test_app_main.py tests/test_user_experience.py`
+  - HTTP API and seat management: `uv run pytest tests/test_http_api.py`
+  - Translation pipeline: `uv run pytest tests/test_high_level.py`
+  - Config parsing and models: `uv run pytest tests/config/test_main.py tests/config/test_model.py`
+- Lint and format:
+  - `uv run ruff check .`
+  - `uv run ruff format .`
+- Frontend:
+  - install/build: `cd frontend && npm install && npm run build`
+  - dev server: `cd frontend && npm run dev`
+- Runtime smoke checks:
+  - warm assets: `uv run pdf2zh_next --warmup`
+  - local GUI: `timeout 10 uv run pdf2zh_next --gui`
+  - HTTP API: `uv run python -m pdf2zh_next.http_api`
+  - CLI PDFs:
+    - `uv run pdf2zh_next ./test/file/translate.cli.plain.text.pdf --output ./test/file`
+    - `uv run pdf2zh_next ./test/file/translate.cli.text.with.figure.pdf --output ./test/file`
+- Packaging and docs:
+  - `uv build`
+  - `uv run mkdocs serve`
+  - `uv run pre-commit run --all-files`
 
 ## Change Guidance
-- Supported Python range is `>=3.10,<3.14`.
-- Follow Ruff formatting and linting. This repo uses Ruff isort with single-line imports.
+- Follow Ruff formatting and linting. The repo uses Ruff isort with single-line imports.
 - Use 4-space indentation, `snake_case` for functions/modules/variables, and `PascalCase` for classes.
 - Keep changes small and targeted. Avoid unrelated refactors when touching:
-  config parsing,
-  translation engines,
-  rate limiting,
-  startup flows,
-  HTTP API behavior,
-  seat management,
-  WebUI serving,
-  frontend/backend payload contracts.
-- When behavior depends on dependency changes, update the relevant manifests:
-  `pyproject.toml` and `uv.lock` for Python;
-  `frontend/package.json` and `frontend/package-lock.json` for frontend.
-- If public behavior, onboarding guidance, screenshots, or user-facing commands change, update `README.md` and the relevant docs under `docs/`.
+  - config parsing
+  - translation engines
+  - rate limiting
+  - CLI or GUI startup
+  - translation workflow helpers
+  - HTTP API behavior
+  - seat management
+  - frontend/backend contracts
+- If behavior depends on dependency changes, update the relevant manifests:
+  - Python: `pyproject.toml` and `uv.lock`
+  - Frontend: `frontend/package.json` and `frontend/package-lock.json`
+- If you change WebUI form fields, service metadata, or browser payloads, verify both `pdf2zh_next/http_api.py` and `frontend/src/lib/` stay in sync.
+- If public behavior changes, update the matching user-facing docs:
+  - `README.md`
+  - relevant pages under `docs/`
 
-## Validation
-- Add or update tests when changing CLI parsing, config models, translation flow, caching, rate limiting, HTTP API behavior, seat management, GUI startup, or frontend/backend contracts.
-- Name tests `tests/test_*.py` or `tests/config/test_*.py`, and test functions `test_*`.
-- Prefer the narrowest relevant validation first, then broader smoke coverage when startup or integration behavior changes.
-- If you touch CLI startup, argument parsing, defaults, or user-facing error messages, run:
-  `uv run pytest tests/test_app_main.py tests/test_user_experience.py tests/config/test_main.py tests/config/test_model.py`
-- If you touch translation workflow helpers or the shared pipeline, run:
-  `uv run pytest tests/test_high_level.py`
-- If you touch HTTP API behavior, GUI startup, static asset serving, seat flows, or frontend/backend contracts, run:
-  `uv run pytest tests/test_http_api.py`
-  `timeout 10 uv run pdf2zh_next --gui`
+## Validation Expectations
+- Add or update tests when changing:
+  - CLI parsing or startup
+  - config models or defaults
+  - translation flow, caching, or rate limiting
+  - HTTP API behavior
+  - GUI startup or static asset serving
+  - seat-management behavior
+  - frontend/backend contracts
+- Prefer the narrowest relevant validation first, then broader smoke coverage for startup or integration changes.
+- If you touch CLI startup, argument parsing, defaults, or user-facing errors, run:
+  - `uv run pytest tests/test_app_main.py tests/test_user_experience.py tests/config/test_main.py tests/config/test_model.py`
+- If you touch the shared translation pipeline, run:
+  - `uv run pytest tests/test_high_level.py`
+- If you touch HTTP API behavior, GUI startup, static asset serving, seat workflows, or frontend/backend contracts, run:
+  - `uv run pytest tests/test_http_api.py`
+  - `timeout 10 uv run pdf2zh_next --gui`
 - Do not modify sample PDFs under `test/file/` unless fixture updates are explicitly required.
 
-## Contribution Rules
+## Contribution Hygiene
 - Use concise Conventional Commit-style commit subjects.
-- Keep docs, examples, and tests aligned with the current implementation.
+- Keep code, tests, docs, and examples aligned with the current implementation.
