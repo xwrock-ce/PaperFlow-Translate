@@ -28,7 +28,7 @@ There are several methods to open the WebUI interface. If you are using **Window
 
     Drop the PDF file into the window and click `Translate`.
 
-5. The first launch may spend some time downloading BabelDOC assets. If you deploy PDFMathTranslate with Docker and use Ollama as the backend LLM, fill `Ollama host` with:
+5. The first translation run may spend some time downloading BabelDOC assets. If you want to pre-download them, run `pdf2zh_next --warmup` before opening the WebUI. If you deploy PDFMathTranslate with Docker and use Ollama as the backend LLM, fill `Ollama host` with:
 
    ```bash
    http://host.docker.internal:11434

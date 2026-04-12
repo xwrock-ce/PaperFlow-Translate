@@ -253,7 +253,6 @@ async def main() -> int:
     if settings.basic.gui:
         from pdf2zh_next.web import setup_gui
 
-        _warmup_assets()
         try:
             await setup_gui(
                 server_host=settings.gui_settings.server_host,

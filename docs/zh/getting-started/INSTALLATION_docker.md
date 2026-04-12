@@ -41,17 +41,17 @@ docker run -d --name pdf2zh-next -p 7860:7860 awwaawwa/pdfmathtranslate-next pdf
 <h4>3. 在浏览器中打开以下地址进入 WebUI 页面：</h4>
 
 ```
-http://127.0.0.1:17860/
+http://127.0.0.1:7860/
 ```
 
-仓库内置的 compose 默认会把服务绑定到宿主机 `127.0.0.1:17860`。如果需要换端口，可以修改 `.env`：
+仓库内置的 compose 默认会把服务绑定到宿主机 `127.0.0.1:7860`。如果需要换端口，可以修改 `.env`：
 
 ```bash
 PDF2ZH_BIND_IP=127.0.0.1
-PDF2ZH_WEB_PORT=17860
+PDF2ZH_WEB_PORT=7860
 ```
 
-如果你前面有 Nginx 或 Caddy，就把它反向代理到 `127.0.0.1:17860`。只有在你明确要直接暴露容器端口时，才把 `PDF2ZH_BIND_IP` 改成 `0.0.0.0`。
+如果你前面有 Nginx 或 Caddy，就把它反向代理到 `127.0.0.1:7860`。只有在你明确要直接暴露容器端口时，才把 `PDF2ZH_BIND_IP` 改成 `0.0.0.0`。
 
 > [!NOTE]
 >

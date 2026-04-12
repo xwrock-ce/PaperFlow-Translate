@@ -26,7 +26,7 @@
 
     将 `PDF` 文件拖入窗口并点击 `Translate`。
 
-5. 如果您通过 docker 部署 PDFMathTranslate，并使用 ollama 作为 PDFMathTranslate 的后端 `LLM`，则应在 "Ollama host" 中填写
+5. 首次发起翻译时，BabelDOC 资源下载可能需要一些时间；如果想提前准备资源，可以先运行 `pdf2zh_next --warmup`。如果您通过 docker 部署 PDFMathTranslate，并使用 ollama 作为 PDFMathTranslate 的后端 `LLM`，则应在 "Ollama host" 中填写
 
    ```bash
    http://host.docker.internal:11434

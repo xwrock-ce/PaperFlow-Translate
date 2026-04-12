@@ -41,17 +41,17 @@ docker run -d --name pdf2zh-next -p 7860:7860 awwaawwa/pdfmathtranslate-next pdf
 <h4>3. Enter this URL in your browser to open the WebUI page:</h4>
 
 ```
-http://127.0.0.1:17860/
+http://127.0.0.1:7860/
 ```
 
-The included compose file binds the service to `127.0.0.1:17860` by default. Change `.env` if you need another host port:
+The included compose file binds the service to `127.0.0.1:7860` by default. Change `.env` if you need another host port:
 
 ```bash
 PDF2ZH_BIND_IP=127.0.0.1
-PDF2ZH_WEB_PORT=17860
+PDF2ZH_WEB_PORT=7860
 ```
 
-If you are connecting through a reverse proxy, proxy to `127.0.0.1:17860`. If you really want to expose the container directly on the public network, set `PDF2ZH_BIND_IP=0.0.0.0`.
+If you are connecting through a reverse proxy, proxy to `127.0.0.1:7860`. If you really want to expose the container directly on the public network, set `PDF2ZH_BIND_IP=0.0.0.0`.
 
 > [!NOTE]
 >
