@@ -19,6 +19,7 @@ from pdf2zh_next import http_api as http_api_module
 from pdf2zh_next.config.cli_env_model import CLIEnvSettingsModel
 from pdf2zh_next.http_api import HTTPServerSettings
 from pdf2zh_next.http_api import _configure_runtime_noise_filters
+from pdf2zh_next.http_api import _stream_job_events
 from pdf2zh_next.http_api import create_app
 from pdf2zh_next.translator.translator_impl.google import GoogleTranslator
 
@@ -710,7 +711,10 @@ def test_stream_translate_upload_returns_progress_and_finish(monkeypatch, tmp_pa
 
 
 def test_google_translator_uses_request_timeout_and_reraises_timeout(monkeypatch):
-    settings = CLIEnvSettingsModel(google=True).to_settings_model()
+    settings = CLIEnvSettingsModel(
+        google=True,
+        google_detail={"google_timeout": "25"},
+    ).to_settings_model()
     translator = GoogleTranslator(settings, Mock())
     calls = []
 
@@ -724,7 +728,8 @@ def test_google_translator_uses_request_timeout_and_reraises_timeout(monkeypatch
         translator.do_translate("hello")
 
     assert len(calls) == 3
-    assert all(call["timeout"] == 10 for call in calls)
+    assert translator.timeout == 25.0
+    assert all(call["timeout"] == 25.0 for call in calls)
 
 
 def test_stream_translate_accepts_frontend_default_blank_optionals(
@@ -1167,6 +1172,79 @@ def test_cleanup_expires_job_artifacts(monkeypatch, tmp_path):
         artifact_url = f"/requests/{request_id}/artifacts/source"
         missing = client.get(artifact_url)
         assert missing.status_code == 404
+    finally:
+        client.close()
+
+
+def test_stream_disconnect_cancels_browser_job(monkeypatch):
+    monkeypatch.setattr(
+        "pdf2zh_next.http_api._load_base_cli_settings",
+        _base_openai_settings,
+    )
+
+    async def slow_translate_stream(_settings, _file_path, *, raise_on_error=True):
+        assert raise_on_error is False
+        yield {
+            "type": "progress_update",
+            "stage": "Translation",
+            "overall_progress": 10,
+            "part_index": 1,
+            "total_parts": 1,
+            "stage_current": 1,
+            "stage_total": 2,
+        }
+        await asyncio.sleep(60)
+
+    monkeypatch.setattr(
+        "pdf2zh_next.http_api.do_translate_async_stream",
+        slow_translate_stream,
+    )
+
+    class _DisconnectingRequest:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def is_disconnected(self) -> bool:
+            self.calls += 1
+            return self.calls >= 3
+
+    client = _client()
+    try:
+        seat_id, lease_token = _claim_seat(client)
+        response = client.post(
+            "/jobs",
+            data={"payload": _job_payload_with_seat(seat_id, lease_token)},
+            files={"file": ("paper.pdf", b"%PDF-1.4\n", "application/pdf")},
+        )
+        assert response.status_code == 202
+        job_id = response.json()["job_id"]
+
+        async def consume_until_disconnect():
+            lines = []
+            async for line in _stream_job_events(
+                client.app.state.job_manager,
+                job_id,
+                legacy_format=True,
+                request=_DisconnectingRequest(),
+                cancel_on_disconnect=True,
+            ):
+                lines.append(json.loads(line))
+            return lines
+
+        lines = client.portal.call(consume_until_disconnect)
+        assert lines
+        assert lines[0]["type"] == "status"
+
+        deadline = time.time() + 2
+        while time.time() < deadline:
+            current = client.get(f"/jobs/{job_id}").json()
+            if current["status"] == "cancelled":
+                break
+            time.sleep(0.05)
+        else:
+            raise AssertionError("job did not cancel after disconnect")
+
+        assert current["status"] == "cancelled"
     finally:
         client.close()
 

@@ -816,6 +816,23 @@ export default function App(): ReactElement {
   const controllerRef = useRef<AbortController | null>(null);
   const serviceDraftsRef = useRef<Record<string, FieldValues>>({});
 
+  useEffect(() => {
+    if (!currentJobId) {
+      return undefined;
+    }
+
+    const handlePageHide = (): void => {
+      if (navigator.sendBeacon) {
+        navigator.sendBeacon(`/jobs/${currentJobId}/cancel`);
+      }
+    };
+
+    window.addEventListener("pagehide", handlePageHide);
+    return () => {
+      window.removeEventListener("pagehide", handlePageHide);
+    };
+  }, [currentJobId]);
+
   const copy = UI_COPY[locale];
   const seatText =
     locale === "zh"
@@ -1628,6 +1645,14 @@ export default function App(): ReactElement {
           streamError.code === "seat_required")
       ) {
         await handleSeatLeaseLost(streamError.message);
+      } else if (
+        streamError instanceof ApiError &&
+        streamError.code === "client_disconnected"
+      ) {
+        setErrorCode("client_disconnected");
+        setTechnicalDetails(streamError.message);
+        setStatusKey("failed");
+        setCurrentJobId(null);
       } else {
         setErrorCode("request_failed");
         setTechnicalDetails((streamError as Error).message);

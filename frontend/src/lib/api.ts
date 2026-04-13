@@ -238,15 +238,25 @@ export async function streamTranslation(
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) {
+        break;
+      }
 
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) {
-      break;
+      buffer += decoder.decode(value, { stream: true });
+      buffer = parseNdjsonChunk(buffer, onEvent);
     }
-
-    buffer += decoder.decode(value, { stream: true });
-    buffer = parseNdjsonChunk(buffer, onEvent);
+  } catch (error) {
+    if ((error as DOMException).name === "AbortError") {
+      throw error;
+    }
+    throw new ApiError("The live connection to the backend was interrupted.", {
+      code: "client_disconnected",
+      hint: "The backend job was asked to stop because the browser lost the live stream.",
+      details: error instanceof Error ? error.message : String(error),
+    });
   }
 
   const tail = buffer.trim();

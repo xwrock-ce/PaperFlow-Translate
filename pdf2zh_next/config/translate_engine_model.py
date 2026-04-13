@@ -151,9 +151,19 @@ class GoogleSettings(BaseModel):
     """Google Translation settings"""
 
     translate_engine_type: Literal["Google"] = Field(default="Google")
+    google_timeout: str = Field(
+        default="20",
+        description="Timeout (seconds) for Google translation requests",
+    )
 
     def validate_settings(self) -> None:
-        pass
+        self.google_timeout = (
+            _check_if_positive_float(
+                _clean_string(self.google_timeout),
+                field="Timeout",
+            )
+            or "20"
+        )
 
 
 class DeepLSettings(BaseModel):

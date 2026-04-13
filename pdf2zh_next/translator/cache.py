@@ -12,6 +12,7 @@ from peewee import TextField
 # we don't init the database here
 db = SqliteDatabase(None)
 logger = logging.getLogger(__name__)
+_CACHE_DB_VERSION = 2
 
 
 class _TranslationCache(Model):
@@ -103,7 +104,7 @@ def init_db(remove_exists=False):
     cache_folder = Path.home() / ".cache" / "pdf2zh_next"
     cache_folder.mkdir(parents=True, exist_ok=True)
     # The current version does not support database migration, so add the version number to the file name.
-    cache_db_path = cache_folder / "cache.v1.db"
+    cache_db_path = cache_folder / f"cache.v{_CACHE_DB_VERSION}.db"
     if remove_exists and cache_db_path.exists():
         cache_db_path.unlink()
     db.init(

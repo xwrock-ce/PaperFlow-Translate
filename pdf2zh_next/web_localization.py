@@ -115,6 +115,7 @@ _ENGINE_PREFIXES = {
     "deepseek": "DeepSeek",
     "dify": "Dify",
     "gemini": "Gemini",
+    "google": "Google",
     "grok": "Grok",
     "groq": "Groq",
     "modelscope": "ModelScope",

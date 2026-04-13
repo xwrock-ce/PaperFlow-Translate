@@ -2846,16 +2846,42 @@ async def _stream_job_events(
     job_id: str,
     *,
     legacy_format: bool = False,
+    request: Request | None = None,
+    cancel_on_disconnect: bool = False,
 ):
     job, queue = await job_manager.subscribe(job_id)
     try:
         while True:
-            event = await queue.get()
+            if (
+                cancel_on_disconnect
+                and request is not None
+                and await request.is_disconnected()
+            ):
+                logger.info(
+                    "Client disconnected from job %s stream; cancelling unfinished job.",
+                    job_id,
+                )
+                with suppress(APIError):
+                    await job_manager.cancel_job(job_id)
+                return
+            try:
+                event = await asyncio.wait_for(queue.get(), timeout=0.5)
+            except asyncio.TimeoutError:
+                continue
             payload = _legacy_stream_event(event) if legacy_format else event
             if payload is not None:
                 yield _coerce_json_line(payload)
             if event.get("type") in {"finish", "error", "cancelled", "expired"}:
                 return
+    except asyncio.CancelledError:
+        if cancel_on_disconnect:
+            logger.info(
+                "Job %s stream task was cancelled; cancelling unfinished job.",
+                job_id,
+            )
+            with suppress(APIError):
+                await job_manager.cancel_job(job_id)
+        raise
     finally:
         await job_manager.unsubscribe(job, queue)
 
@@ -3468,12 +3494,13 @@ def create_app(
 
     @app.post("/translate/file/stream", tags=["translation"])
     async def translate_file_stream(
+        http_request: Request,
         file: Annotated[UploadFile | None, File()] = None,
         file_url: Annotated[str | None, Form()] = None,
         request_json: Annotated[str, Form()] = "{}",
     ) -> StreamingResponse:
         try:
-            request = BrowserTranslateRequest.model_validate_json(request_json)
+            browser_request = BrowserTranslateRequest.model_validate_json(request_json)
         except ValidationError as exc:
             raise APIError(
                 status_code=422,
@@ -3482,18 +3509,21 @@ def create_app(
                 details=exc.errors(),
             ) from exc
 
-        job = await _create_browser_job(request, file=file, file_url=file_url)
+        job = await _create_browser_job(browser_request, file=file, file_url=file_url)
         return StreamingResponse(
             _stream_job_events(
                 app.state.job_manager,
                 job.job_id,
                 legacy_format=True,
+                request=http_request,
+                cancel_on_disconnect=True,
             ),
             media_type="application/x-ndjson",
         )
 
     @app.post("/translate/upload/stream", tags=["translation"])
     async def translate_upload_stream(
+        request: Request,
         payload: Annotated[str, Form()],
         file: Annotated[UploadFile | None, File()] = None,
     ) -> StreamingResponse:
@@ -3512,6 +3542,8 @@ def create_app(
                 app.state.job_manager,
                 job.job_id,
                 legacy_format=True,
+                request=request,
+                cancel_on_disconnect=True,
             ):
                 yield line
 
@@ -3519,6 +3551,7 @@ def create_app(
 
     @app.post("/api/translate/stream", tags=["frontend"])
     async def translate_stream(
+        request: Request,
         payload: Annotated[str, Form()],
         file: Annotated[UploadFile | None, File()] = None,
     ) -> StreamingResponse:
@@ -3528,6 +3561,8 @@ def create_app(
                 app.state.job_manager,
                 job.job_id,
                 legacy_format=True,
+                request=request,
+                cancel_on_disconnect=True,
             ),
             media_type="application/x-ndjson",
         )

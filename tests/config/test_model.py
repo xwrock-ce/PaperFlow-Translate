@@ -6,6 +6,7 @@ from pdf2zh_next.config.model import BasicSettings
 from pdf2zh_next.config.model import GUISettings
 from pdf2zh_next.config.model import PDFSettings
 from pdf2zh_next.config.model import TranslationSettings
+from pdf2zh_next.config.translate_engine_model import GoogleSettings
 from pdf2zh_next.config.translate_engine_model import OpenAISettings
 
 
@@ -278,6 +279,21 @@ class TestOpenAISettings:
         # URL should remain unchanged
         assert original_url == "http://api.example.com"
         assert settings.openai_detail.openai_base_url == "http://api.example.com"
+
+
+class TestGoogleSettings:
+    def test_default_values(self):
+        settings = GoogleSettings()
+        assert settings.google_timeout == "20"
+
+    def test_validate_settings(self):
+        settings = GoogleSettings(google_timeout=" 30 ")
+        settings.validate_settings()
+        assert settings.google_timeout == "30"
+
+        invalid = GoogleSettings(google_timeout="0")
+        with pytest.raises(ValueError, match="Timeout must be greater than 0"):
+            invalid.validate_settings()
 
 
 class TestCLIEnvSettingsModel:

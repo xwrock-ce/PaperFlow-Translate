@@ -1,14 +1,54 @@
 import contextlib
+import hashlib
+import json
 import logging
 import re
 from abc import ABC
 from abc import abstractmethod
+from pathlib import Path
 
 from pdf2zh_next.config.model import SettingsModel
 from pdf2zh_next.translator.base_rate_limiter import BaseRateLimiter
 from pdf2zh_next.translator.cache import TranslationCache
 
 logger = logging.getLogger(__name__)
+
+
+def _glossary_cache_digest(glossaries: str | None) -> str | None:
+    if not glossaries:
+        return None
+
+    entries = []
+    for raw_value in glossaries.split(","):
+        normalized = raw_value.strip()
+        if not normalized:
+            continue
+
+        glossary_path = Path(normalized).expanduser()
+        if not glossary_path.exists() or not glossary_path.is_file():
+            entries.append({"path": normalized, "missing": True})
+            continue
+
+        try:
+            content_digest = hashlib.sha256(glossary_path.read_bytes()).hexdigest()
+        except OSError:
+            entries.append({"path": str(glossary_path.resolve()), "unreadable": True})
+            continue
+
+        stat = glossary_path.stat()
+        entries.append(
+            {
+                "path": str(glossary_path.resolve()),
+                "sha256": content_digest,
+                "size": stat.st_size,
+            }
+        )
+
+    if not entries:
+        return None
+
+    payload = json.dumps(entries, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
 
 
 class BaseTranslator(ABC):
@@ -48,6 +88,17 @@ class BaseTranslator(ABC):
                 "lang_out": lang_out,
             },
         )
+        self.add_cache_impact_parameters(
+            "custom_system_prompt",
+            settings.translation.custom_system_prompt or None,
+        )
+        self.add_cache_impact_parameters(
+            "no_auto_extract_glossary",
+            settings.translation.no_auto_extract_glossary,
+        )
+        glossary_digest = _glossary_cache_digest(settings.translation.glossaries)
+        if glossary_digest is not None:
+            self.add_cache_impact_parameters("glossaries", glossary_digest)
 
         self.translate_call_count = 0
         self.translate_cache_call_count = 0

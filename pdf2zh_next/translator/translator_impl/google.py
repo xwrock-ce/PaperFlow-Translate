@@ -14,7 +14,7 @@ from tenacity import stop_after_attempt
 from tenacity import wait_exponential
 
 logger = logging.getLogger(__name__)
-_GOOGLE_REQUEST_TIMEOUT_SECONDS = 10
+_DEFAULT_GOOGLE_REQUEST_TIMEOUT_SECONDS = 20
 
 
 def remove_control_characters(s):
@@ -33,6 +33,10 @@ class GoogleTranslator(BaseTranslator):
         super().__init__(settings, rate_limiter)
         self.session = requests.Session()
         self.endpoint = "https://translate.google.com/m"
+        self.timeout = float(
+            settings.translate_engine_settings.google_timeout
+            or _DEFAULT_GOOGLE_REQUEST_TIMEOUT_SECONDS
+        )
         self.headers = {
             "User-Agent": "Mozilla/4.0 (compatible;MSIE 6.0;Windows NT 5.1;SV1;.NET CLR 1.1.4322;.NET CLR 2.0.50727;.NET CLR 3.0.04506.30)"  # noqa: E501
         }
@@ -50,7 +54,7 @@ class GoogleTranslator(BaseTranslator):
             self.endpoint,
             params={"tl": self.lang_out, "sl": self.lang_in, "q": text},
             headers=self.headers,
-            timeout=_GOOGLE_REQUEST_TIMEOUT_SECONDS,
+            timeout=self.timeout,
         )
         if response.status_code == 400:
             result = "IRREPARABLE TRANSLATION ERROR"
