@@ -116,6 +116,8 @@ class HealthResponse(BaseModel):
     max_concurrent_jobs: int
     max_queue_size: int
     job_retention_minutes: int
+    failed_job_retention_minutes: int
+    cancelled_job_retention_minutes: int
 
 
 class TranslationArtifact(BaseModel):
@@ -274,6 +276,8 @@ class HTTPServerSettings(BaseModel):
     max_queue_size: int = Field(default=32, ge=1)
     max_upload_size_mb: int = Field(default=100, ge=1)
     job_retention_minutes: int = Field(default=30, ge=1)
+    failed_job_retention_minutes: int = Field(default=5, ge=1)
+    cancelled_job_retention_minutes: int = Field(default=5, ge=1)
     cleanup_interval_minutes: int = Field(default=5, ge=1)
     metadata_retention_minutes: int = Field(default=24 * 60, ge=1)
     enable_file_url: bool = Field(default=False)
@@ -390,6 +394,56 @@ def _utc_now() -> datetime:
 
 def _dt_to_iso8601(value: datetime | None) -> str | None:
     return value.isoformat() if value else None
+
+
+def _job_retention_minutes_for_status(
+    server_settings: HTTPServerSettings,
+    status: str,
+) -> int:
+    if status == "failed":
+        return server_settings.failed_job_retention_minutes
+    if status == "cancelled":
+        return server_settings.cancelled_job_retention_minutes
+    return server_settings.job_retention_minutes
+
+
+def _orphan_retention_minutes(server_settings: HTTPServerSettings) -> int:
+    return max(
+        server_settings.job_retention_minutes,
+        server_settings.failed_job_retention_minutes,
+        server_settings.cancelled_job_retention_minutes,
+    )
+
+
+def _cleanup_output_dir(output_dir: Path) -> None:
+    shutil.rmtree(output_dir, ignore_errors=True)
+
+
+async def _cleanup_output_dir_on_error(
+    output_dir: Path,
+    factory,
+):
+    try:
+        return await factory()
+    except Exception:
+        _cleanup_output_dir(output_dir)
+        raise
+
+
+def _is_managed_request_file(file_path: Path, output_dir: Path) -> bool:
+    try:
+        resolved_file = file_path.resolve(strict=False)
+        resolved_output = output_dir.resolve(strict=False)
+    except OSError:
+        return False
+    return resolved_file.is_relative_to(resolved_output)
+
+
+def _cleanup_managed_request_file(file_path: Path, output_dir: Path) -> None:
+    if not _is_managed_request_file(file_path, output_dir):
+        return
+    with suppress(OSError):
+        file_path.unlink(missing_ok=True)
 
 
 def _normalize_display_name(value: str) -> str:
@@ -1063,7 +1117,10 @@ class TranslationJobManager:
                 job.status = "cancelled"
                 job.finished_at = _utc_now()
                 job.expires_at = job.finished_at + timedelta(
-                    minutes=self.server_settings.job_retention_minutes
+                    minutes=_job_retention_minutes_for_status(
+                        self.server_settings,
+                        "cancelled",
+                    )
                 )
                 if job.job_id in self._queued_job_ids:
                     self._queued_job_ids.remove(job.job_id)
@@ -1077,6 +1134,7 @@ class TranslationJobManager:
             else:
                 event = None
         if event:
+            _cleanup_managed_request_file(job.file_path, Path(job.output_dir))
             await self._publish(job, event)
             await self._clear_job_seat(job)
         return job
@@ -1106,6 +1164,8 @@ class TranslationJobManager:
             "max_concurrent_jobs": self.server_settings.max_concurrent_jobs,
             "max_queue_size": self.server_settings.max_queue_size,
             "job_retention_minutes": self.server_settings.job_retention_minutes,
+            "failed_job_retention_minutes": self.server_settings.failed_job_retention_minutes,
+            "cancelled_job_retention_minutes": self.server_settings.cancelled_job_retention_minutes,
         }
 
     def metrics_payload(self) -> dict[str, Any]:
@@ -1154,9 +1214,9 @@ class TranslationJobManager:
             except OSError:
                 continue
             if now >= modified_at + timedelta(
-                minutes=self.server_settings.job_retention_minutes
+                minutes=_orphan_retention_minutes(self.server_settings)
             ):
-                shutil.rmtree(orphan_dir, ignore_errors=True)
+                _cleanup_output_dir(orphan_dir)
         async with self._lock:
             for job_id in purge_targets:
                 job = self._jobs.pop(job_id, None)
@@ -1168,7 +1228,7 @@ class TranslationJobManager:
 
     async def _expire_job(self, job: _TranslationJob) -> None:
         output_dir = Path(job.output_dir)
-        shutil.rmtree(output_dir, ignore_errors=True)
+        _cleanup_output_dir(output_dir)
         async with self._lock:
             if job.status == "expired":
                 return
@@ -1253,10 +1313,14 @@ class TranslationJobManager:
                         }
                         job.finished_at = _utc_now()
                         job.expires_at = job.finished_at + timedelta(
-                            minutes=self.server_settings.job_retention_minutes
+                            minutes=_job_retention_minutes_for_status(
+                                self.server_settings,
+                                "failed",
+                            )
                         )
                         self._metrics["failed"] += 1
                         job.done_event.set()
+                    _cleanup_managed_request_file(job.file_path, Path(job.output_dir))
                     await self._publish(job, self._event_payload(job, "error"))
                     await self._clear_job_seat(job)
                     return
@@ -1274,7 +1338,10 @@ class TranslationJobManager:
                         job.result = response
                         job.finished_at = _utc_now()
                         job.expires_at = job.finished_at + timedelta(
-                            minutes=self.server_settings.job_retention_minutes
+                            minutes=_job_retention_minutes_for_status(
+                                self.server_settings,
+                                "succeeded",
+                            )
                         )
                         self._metrics["succeeded"] += 1
                         job.done_event.set()
@@ -1289,10 +1356,14 @@ class TranslationJobManager:
                 }
                 job.finished_at = _utc_now()
                 job.expires_at = job.finished_at + timedelta(
-                    minutes=self.server_settings.job_retention_minutes
+                    minutes=_job_retention_minutes_for_status(
+                        self.server_settings,
+                        "failed",
+                    )
                 )
                 self._metrics["failed"] += 1
                 job.done_event.set()
+            _cleanup_managed_request_file(job.file_path, Path(job.output_dir))
             await self._publish(job, self._event_payload(job, "error"))
             await self._clear_job_seat(job)
         except asyncio.CancelledError:
@@ -1300,10 +1371,14 @@ class TranslationJobManager:
                 job.status = "cancelled"
                 job.finished_at = _utc_now()
                 job.expires_at = job.finished_at + timedelta(
-                    minutes=self.server_settings.job_retention_minutes
+                    minutes=_job_retention_minutes_for_status(
+                        self.server_settings,
+                        "cancelled",
+                    )
                 )
                 self._metrics["cancelled"] += 1
                 job.done_event.set()
+            _cleanup_managed_request_file(job.file_path, Path(job.output_dir))
             await self._publish(job, self._event_payload(job, "cancelled"))
             await self._clear_job_seat(job)
         except Exception as exc:
@@ -1317,10 +1392,14 @@ class TranslationJobManager:
                 }
                 job.finished_at = _utc_now()
                 job.expires_at = job.finished_at + timedelta(
-                    minutes=self.server_settings.job_retention_minutes
+                    minutes=_job_retention_minutes_for_status(
+                        self.server_settings,
+                        "failed",
+                    )
                 )
                 self._metrics["failed"] += 1
                 job.done_event.set()
+            _cleanup_managed_request_file(job.file_path, Path(job.output_dir))
             await self._publish(job, self._event_payload(job, "error"))
             await self._clear_job_seat(job)
 
@@ -1635,6 +1714,9 @@ async def _save_uploaded_pdf(
                     missing = 5 - len(pdf_header)
                     pdf_header += chunk[:missing]
                 output_file.write(chunk)
+    except Exception:
+        file_path.unlink(missing_ok=True)
+        raise
     finally:
         await upload.close()
 
@@ -3098,6 +3180,10 @@ def create_app(
             max_concurrent_jobs=health_payload["max_concurrent_jobs"],
             max_queue_size=health_payload["max_queue_size"],
             job_retention_minutes=health_payload["job_retention_minutes"],
+            failed_job_retention_minutes=health_payload["failed_job_retention_minutes"],
+            cancelled_job_retention_minutes=health_payload[
+                "cancelled_job_retention_minutes"
+            ],
         )
 
     @app.get("/engines", tags=["meta"])
@@ -3259,20 +3345,24 @@ def create_app(
             request_id,
             request.output_dir,
         )
-        file_path = _prepare_request_source(request, output_dir, server_settings)
-        settings = _build_request_settings(
-            request,
-            file_path=file_path,
-            output_dir=output_dir,
-        )
-        return await _submit_translation_job(
-            job_manager=app.state.job_manager,
-            seat_manager=None,
-            settings=settings,
-            file_path=file_path,
-            request_id=request_id,
-            output_dir=output_dir,
-        )
+
+        async def _build_job() -> _TranslationJob:
+            file_path = _prepare_request_source(request, output_dir, server_settings)
+            settings = _build_request_settings(
+                request,
+                file_path=file_path,
+                output_dir=output_dir,
+            )
+            return await _submit_translation_job(
+                job_manager=app.state.job_manager,
+                seat_manager=None,
+                settings=settings,
+                file_path=file_path,
+                request_id=request_id,
+                output_dir=output_dir,
+            )
+
+        return await _cleanup_output_dir_on_error(output_dir, _build_job)
 
     async def _create_browser_job(
         request: BrowserTranslateRequest,
@@ -3292,26 +3382,30 @@ def create_app(
         )
         request_id = str(uuid.uuid4())
         output_dir = _prepare_request_output_dir(request_id, None)
-        file_path = (
-            await _save_uploaded_pdf(file, output_dir, server_settings)
-            if file
-            else _download_pdf_from_url(file_url or "", output_dir, server_settings)
-        )
-        settings = _build_browser_request_settings(
-            request,
-            file_path=file_path,
-            output_dir=output_dir,
-        )
-        return await _submit_translation_job(
-            job_manager=app.state.job_manager,
-            seat_manager=app.state.seat_manager,
-            settings=settings,
-            file_path=file_path,
-            request_id=request_id,
-            output_dir=output_dir,
-            seat_id=seat_id,
-            lease_token=lease_token,
-        )
+
+        async def _build_job() -> _TranslationJob:
+            file_path = (
+                await _save_uploaded_pdf(file, output_dir, server_settings)
+                if file
+                else _download_pdf_from_url(file_url or "", output_dir, server_settings)
+            )
+            settings = _build_browser_request_settings(
+                request,
+                file_path=file_path,
+                output_dir=output_dir,
+            )
+            return await _submit_translation_job(
+                job_manager=app.state.job_manager,
+                seat_manager=app.state.seat_manager,
+                settings=settings,
+                file_path=file_path,
+                request_id=request_id,
+                output_dir=output_dir,
+                seat_id=seat_id,
+                lease_token=lease_token,
+            )
+
+        return await _cleanup_output_dir_on_error(output_dir, _build_job)
 
     async def _create_webui_job(
         payload_text: str,
@@ -3334,28 +3428,32 @@ def create_app(
             ) from exc
         request_id = str(uuid.uuid4())
         output_dir = _prepare_request_output_dir(request_id, None)
-        file_path = await _save_uploaded_pdf(file, output_dir, server_settings)
-        try:
-            _cli_settings, settings = _build_settings_from_webui(
-                _load_base_cli_settings(),
-                webui_payload,
+
+        async def _build_job() -> _TranslationJob:
+            file_path = await _save_uploaded_pdf(file, output_dir, server_settings)
+            try:
+                _cli_settings, settings = _build_settings_from_webui(
+                    _load_base_cli_settings(),
+                    webui_payload,
+                    file_path=file_path,
+                    output_dir=output_dir,
+                )
+            except WebUIError as exc:
+                raise APIError(
+                    status_code=400,
+                    code="invalid_translation_settings",
+                    message=str(exc),
+                ) from exc
+            return await _submit_translation_job(
+                job_manager=app.state.job_manager,
+                seat_manager=None,
+                settings=settings,
                 file_path=file_path,
+                request_id=request_id,
                 output_dir=output_dir,
             )
-        except WebUIError as exc:
-            raise APIError(
-                status_code=400,
-                code="invalid_translation_settings",
-                message=str(exc),
-            ) from exc
-        return await _submit_translation_job(
-            job_manager=app.state.job_manager,
-            seat_manager=None,
-            settings=settings,
-            file_path=file_path,
-            request_id=request_id,
-            output_dir=output_dir,
-        )
+
+        return await _cleanup_output_dir_on_error(output_dir, _build_job)
 
     async def _create_frontend_job(
         payload_text: str,
@@ -3377,35 +3475,39 @@ def create_app(
         )
         request_id = str(uuid.uuid4())
         output_dir = _prepare_request_output_dir(request_id, None)
-        if translate_payload.source_type == "link":
-            file_path = _download_pdf_from_url(
-                translate_payload.file_url or "",
-                output_dir,
-                server_settings,
-            )
-        else:
-            if file is None:
-                raise APIError(
-                    status_code=400,
-                    code="missing_upload",
-                    message="Upload a PDF file when `source_type` is `file`.",
+
+        async def _build_job() -> _TranslationJob:
+            if translate_payload.source_type == "link":
+                file_path = _download_pdf_from_url(
+                    translate_payload.file_url or "",
+                    output_dir,
+                    server_settings,
                 )
-            file_path = await _save_uploaded_pdf(file, output_dir, server_settings)
-        settings = _build_web_request_settings(
-            translate_payload,
-            file_path=file_path,
-            output_dir=output_dir,
-        )
-        return await _submit_translation_job(
-            job_manager=app.state.job_manager,
-            seat_manager=app.state.seat_manager,
-            settings=settings,
-            file_path=file_path,
-            request_id=request_id,
-            output_dir=output_dir,
-            seat_id=seat_id,
-            lease_token=lease_token,
-        )
+            else:
+                if file is None:
+                    raise APIError(
+                        status_code=400,
+                        code="missing_upload",
+                        message="Upload a PDF file when `source_type` is `file`.",
+                    )
+                file_path = await _save_uploaded_pdf(file, output_dir, server_settings)
+            settings = _build_web_request_settings(
+                translate_payload,
+                file_path=file_path,
+                output_dir=output_dir,
+            )
+            return await _submit_translation_job(
+                job_manager=app.state.job_manager,
+                seat_manager=app.state.seat_manager,
+                settings=settings,
+                file_path=file_path,
+                request_id=request_id,
+                output_dir=output_dir,
+                seat_id=seat_id,
+                lease_token=lease_token,
+            )
+
+        return await _cleanup_output_dir_on_error(output_dir, _build_job)
 
     async def _download_artifact_impl(
         request_id: str,

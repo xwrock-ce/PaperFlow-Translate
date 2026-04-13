@@ -54,6 +54,12 @@ def _make_pdf(tmp_path):
     return pdf_path
 
 
+def _set_http_output_root(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    output_root = tmp_path / "http_api"
+    monkeypatch.setattr(http_api_module, "_HTTP_OUTPUT_ROOT", output_root)
+    return output_root
+
+
 def _base_openai_settings() -> CLIEnvSettingsModel:
     return CLIEnvSettingsModel(
         openai=True,
@@ -152,6 +158,8 @@ def test_healthz_returns_status_and_version():
     assert payload["running_jobs"] == 0
     assert payload["queued_jobs"] == 0
     assert payload["job_retention_minutes"] == 30
+    assert payload["failed_job_retention_minutes"] == 5
+    assert payload["cancelled_job_retention_minutes"] == 5
 
 
 def test_translate_rejects_local_input_file_in_public_mode(tmp_path):
@@ -592,6 +600,133 @@ def test_translate_returns_structured_failure(monkeypatch, tmp_path):
     assert "did not respond in time" in payload["error"]["hint"]
 
 
+def test_failed_job_deletes_uploaded_source_file(monkeypatch, tmp_path):
+    output_root = _set_http_output_root(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        "pdf2zh_next.http_api._load_base_cli_settings",
+        _base_openai_settings,
+    )
+
+    async def failing_translate_stream(_settings, _file_path, *, raise_on_error=True):
+        assert raise_on_error is False
+        yield {
+            "type": "error",
+            "error": "network timeout",
+            "details": "connection reset by peer",
+        }
+
+    monkeypatch.setattr(
+        "pdf2zh_next.http_api.do_translate_async_stream",
+        failing_translate_stream,
+    )
+
+    client = _client(server_settings=HTTPServerSettings(failed_job_retention_minutes=3))
+    try:
+        seat_id, lease_token = _claim_seat(client)
+        response = client.post(
+            "/jobs",
+            data={"payload": _job_payload_with_seat(seat_id, lease_token)},
+            files={"file": ("paper.pdf", b"%PDF-1.4\n", "application/pdf")},
+        )
+        assert response.status_code == 202
+
+        deadline = time.time() + 2
+        while time.time() < deadline:
+            current = client.get(f"/jobs/{response.json()['job_id']}").json()
+            if current["status"] == "failed":
+                break
+            time.sleep(0.05)
+        else:
+            raise AssertionError("job did not fail in time")
+
+        output_dir = Path(current["output_dir"])
+        assert output_dir.exists()
+        assert not (output_dir / "source.pdf").exists()
+        assert current["retention_seconds"] is not None
+        assert current["retention_seconds"] <= 3 * 60
+        assert sorted(path.name for path in output_root.iterdir()) == [output_dir.name]
+    finally:
+        client.close()
+
+
+def test_frontend_job_cleanup_on_invalid_settings(monkeypatch, tmp_path):
+    output_root = _set_http_output_root(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        "pdf2zh_next.http_api._load_base_cli_settings",
+        _base_openai_settings,
+    )
+
+    client = _client()
+    try:
+        seat_id, lease_token = _claim_seat(client)
+        response = client.post(
+            "/jobs",
+            data={
+                "payload": json.dumps(
+                    {
+                        "settings": {
+                            "openai": True,
+                            "openai_detail": {"openai_api_key": "test-key"},
+                            "pdf": {"no_mono": True, "no_dual": True},
+                        },
+                        "source_type": "file",
+                        "seat_id": seat_id,
+                        "lease_token": lease_token,
+                    }
+                )
+            },
+            files={"file": ("paper.pdf", b"%PDF-1.4\n", "application/pdf")},
+        )
+
+        assert response.status_code == 400
+        assert response.json()["error"]["code"] == "invalid_translation_settings"
+        assert not output_root.exists() or not any(output_root.iterdir())
+    finally:
+        client.close()
+
+
+def test_browser_upload_cleanup_on_payload_too_large(monkeypatch, tmp_path):
+    output_root = _set_http_output_root(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        "pdf2zh_next.http_api._load_base_cli_settings",
+        _base_openai_settings,
+    )
+
+    client = _client(server_settings=HTTPServerSettings(max_upload_size_mb=1))
+    try:
+        seat_id, lease_token = _claim_seat(client)
+        response = client.post(
+            "/translate/file",
+            data={
+                "request_json": json.dumps(
+                    {
+                        "service": "OpenAI",
+                        "seat_id": seat_id,
+                        "lease_token": lease_token,
+                        "lang_in": "en",
+                        "lang_out": "zh",
+                        "translation": {},
+                        "pdf": {},
+                        "engine_settings": {"openai_api_key": "test-key"},
+                    }
+                )
+            },
+            files={
+                "file": (
+                    "paper.pdf",
+                    b"%PDF-1.4\n" + (b"0" * (1024 * 1024)),
+                    "application/pdf",
+                )
+            },
+        )
+
+        assert response.status_code == 413
+        assert response.json()["error"]["code"] == "payload_too_large"
+        assert not output_root.exists() or not any(output_root.iterdir())
+    finally:
+        client.close()
+
+
 def test_save_config_keeps_existing_sensitive_values(monkeypatch):
     monkeypatch.setattr(
         "pdf2zh_next.http_api._load_base_cli_settings",
@@ -1015,7 +1150,8 @@ def test_jobs_endpoint_returns_status_and_result(monkeypatch, tmp_path):
         client.close()
 
 
-def test_jobs_queue_full(monkeypatch):
+def test_jobs_queue_full(monkeypatch, tmp_path):
+    output_root = _set_http_output_root(monkeypatch, tmp_path)
     monkeypatch.setattr(
         "pdf2zh_next.http_api._load_base_cli_settings",
         _base_openai_settings,
@@ -1102,6 +1238,7 @@ def test_jobs_queue_full(monkeypatch):
         )
         assert third.status_code == 429
         assert third.json()["error"]["code"] == "queue_full"
+        assert len([path for path in output_root.iterdir() if path.is_dir()]) == 2
 
         cancelled = client.post(f"/jobs/{second_job_id}/cancel")
         assert cancelled.status_code == 200
